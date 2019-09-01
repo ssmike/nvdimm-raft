@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+message SampleMessage {
+    uint32 Field = 1;
+    string Field2 = 2;
+}
+
+service MyService {
+}
