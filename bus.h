@@ -21,7 +21,6 @@ private:
 class Throttler {
 public:
     virtual bool accept_connection() = 0;
-    virtual bool accept_request() = 0;
 };
 
 class TcpBus {
@@ -30,7 +29,7 @@ public:
 
     void set_throttler(Throttler&);
 
-    void set_handler(size_t method, std::function<void(GenericBuffer&)>);
+    void set_handler(std::function<void(int, GenericBuffer&)>);
 
     int register_endpoint(std::string addr, int port);
 

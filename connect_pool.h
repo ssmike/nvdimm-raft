@@ -8,16 +8,6 @@ namespace bus {
 
 using GenericBuffer = std::vector<char, std::allocator<char>>;
 
-struct ConnData {
-    enum State {
-        kReading = 0,
-        kWriting = 1,
-        kIdle = 2,
-    } state;
-
-    GenericBuffer& buf;
-};
-
 class SocketHolder {
 public:
     explicit SocketHolder(int sock): sock_(sock) {}
@@ -48,16 +38,28 @@ private:
     static constexpr int kInvalidSocket = -1;
 };
 
+struct ConnData {
+    enum State {
+        kReading = 0,
+        kWriting = 1,
+        kIdle = 2,
+    } state;
+
+    GenericBuffer& in_buf;
+    GenericBuffer& out_buf;
+    SocketHolder socket;
+};
+
 class ConnectPool {
 public:
-    ConnectPool(size_t ingr_size, size_t egr_size);
+    ConnectPool();
 
-    void add_ingress(int fd, uint64_t desc);
-    void add_egress(int fd, uint64_t desc, int hint);
+    void add(int fd, uint64_t id, int hint);
 
-    void get(uint64_t desc);
+    ConnData* select(uint64_t);
+    ConnData* select(int hint);
 
-    void close(int fd);
+    void close(uint64_t);
     void close_old_conns();
 
 private:

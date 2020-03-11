@@ -8,9 +8,11 @@
 #include <netinet/tcp.h>
 #include <unistd.h>
 
+#include <string_view>
 #include <sstream>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <map>
 #include <vector>
 
@@ -21,6 +23,19 @@ void throw_errno() {
 }
 
 #define CHECK_ERRNO(x) if (!(x)) throw_errno();
+
+struct SockaddrHash {
+    size_t operator()(const sockaddr_in6& addr) const {
+        std::string_view view(reinterpret_cast<const char*>(&addr), sizeof(addr));
+        return std::hash<std::string_view>()(view);
+    }
+};
+
+struct SockaddrCompare {
+    bool operator() (const sockaddr_in6& addr1, const sockaddr_in6& addr2) const {
+        return memcmp(&addr1, &addr2, sizeof(struct sockaddr_in6)) == 0;
+    }
+};
 
 class TcpBus::Impl {
 public:
@@ -50,23 +65,30 @@ public:
     }
 
     ~Impl() {
-        for (auto endpoint : endpoints_) {
-            if (endpoint) {
-                freeaddrinfo(endpoint);
-            }
-        }
         close(listensock_);
+        close(epollfd_);
+    }
+
+    int resolve(sockaddr_in6* addr) {
+        if (resolve_map_.find(*addr) != resolve_map_.end()) {
+            return resolve_map_[*addr];
+        }
+        int result = resolve_map_.size();
+        resolve_map_[*addr] = result;
+        return result;
     }
 
     void accept_conns() {
         for (size_t i = 0; i < 2; ++i) {
             if (throttler_ && !throttler_->accept_connection()) return;
-            SocketHolder sock(accept4(listensock_, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC));
-            if (sock.get() >= 0) {
+            sockaddr_in6 addr;
+            socklen_t addrlen = sizeof(addr);
+            SocketHolder sock(accept4(listensock_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC));
+            if (sock.get() >= 0 && addr.sin6_family == AF_INET6 && addrlen == sizeof(addr)) {
                 int flags = 1;
                 CHECK_ERRNO(setsockopt(sock.get(), IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags)) == 0);
                 uint64_t id = add_socket(sock.get(), EPOLLIN | EPOLLOUT | EPOLLET);
-                pool_.add_ingress(sock.release(), id);
+                pool_.add(sock.release(), id, resolve(&addr));
             } if (errno == EAGAIN) {
                 return;
             } else  if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
@@ -86,6 +108,10 @@ public:
                 if (id == kListenId) {
                     accept_conns();
                 } else {
+                    if (event_buf_[i].events | EPOLLIN) {
+                    }
+                    if (event_buf_[i].events | EPOLLOUT) {
+                    }
                 }
             }
         }
@@ -101,8 +127,7 @@ public:
 
 public:
     Throttler* throttler_ = nullptr;
-    std::vector<std::function<void(GenericBuffer&)>> handlers_;
-    std::vector<addrinfo*> endpoints_;
+    std::function<void(int, GenericBuffer&)> handler_;
 
     int epollfd_;
     int listensock_;
@@ -116,6 +141,10 @@ public:
 
     std::vector<epoll_event> event_buf_;
     ConnectPool& pool_;
+
+    std::unordered_map<sockaddr_in6, int, SockaddrHash, SockaddrCompare> resolve_map_;
+
+    std::vector<sockaddr_in6> endpoints_;
 };
 
 TcpBus::TcpBus(int port, ConnectPool& pool)
@@ -127,9 +156,8 @@ void TcpBus::set_throttler(Throttler& t) {
     impl_->throttler_ = &t;
 }
 
-void TcpBus::set_handler(size_t method, std::function<void(GenericBuffer&)> handler) {
-    impl_->handlers_.resize(std::max<size_t>(impl_->handlers_.size(), method));
-    impl_->handlers_[method] = handler;
+void TcpBus::set_handler(std::function<void(int, GenericBuffer&)> handler) {
+    impl_->handler_ = handler;
 }
 
 int TcpBus::register_endpoint(std::string addr, int port) {
@@ -144,8 +172,14 @@ int TcpBus::register_endpoint(std::string addr, int port) {
     if (res != 0) {
         throw BusError(gai_strerror(res));
     }
-    impl_->endpoints_.push_back(info);
-    return impl_->endpoints_.size();
+    int result = impl_->resolve_map_.size();
+    for (addrinfo* i = info; i != nullptr; i = i->ai_next) {
+        if (info->ai_family == AF_INET6) {
+            impl_->resolve_map_[*reinterpret_cast<sockaddr_in6*>(info->ai_addr)] = result;
+        }
+    }
+    freeaddrinfo(info);
+    return result;
 }
 
 void TcpBus::send(int dest, size_t method, GenericBuffer&) {
