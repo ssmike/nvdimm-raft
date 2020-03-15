@@ -21,25 +21,6 @@
 
 namespace bus {
 
-struct SockaddrHash {
-    size_t operator()(const sockaddr_in6& addr) const {
-        std::string_view view(reinterpret_cast<const char*>(&addr), sizeof(addr));
-        return std::hash<std::string_view>()(view);
-    }
-};
-
-struct SockaddrCompare {
-    bool operator() (const sockaddr_in6& addr1, const sockaddr_in6& addr2) const {
-        return memcmp(&addr1, &addr2, sizeof(struct sockaddr_in6)) == 0;
-    }
-};
-
-void set_nodelay(int socket) {
-  int flags = 1;
-  CHECK_ERRNO(
-      setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags)) == 0);
-}
-
 class TcpBus::Impl {
 public:
     Impl(int port, size_t fixed_pool_size, ConnectPool& pool, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
