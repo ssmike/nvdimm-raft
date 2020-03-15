@@ -12,3 +12,7 @@ namespace std {
 
     class exception;
 }
+
+namespace bus {
+    using GenericBuffer = std::vector<char, std::allocator<char>>;
+}

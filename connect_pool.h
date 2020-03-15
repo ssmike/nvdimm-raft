@@ -3,10 +3,9 @@
 #include "fwd.h"
 #include <stdint.h>
 #include <cstddef>
+#include <utility>
 
 namespace bus {
-
-using GenericBuffer = std::vector<char, std::allocator<char>>;
 
 class SocketHolder {
 public:
@@ -18,6 +17,10 @@ public:
     SocketHolder(SocketHolder&& oth)
         : SocketHolder(oth.release())
     {
+    }
+
+    void operator =(SocketHolder&& oth) {
+        std::swap(sock_, oth.sock_);
     }
 
     int get() {
@@ -49,6 +52,8 @@ struct ConnData {
 class ConnectPool {
 public:
     ConnectPool();
+
+    size_t make_id();
 
     void add(SocketHolder, uint64_t id, int hint);
 
