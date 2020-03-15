@@ -25,7 +25,7 @@ public:
 
 class TcpBus {
 public:
-    TcpBus(int port, ConnectPool& pool_);
+    TcpBus(int port, size_t fixed_pool_size, ConnectPool& pool_);
 
     void set_throttler(Throttler&);
 
@@ -33,7 +33,7 @@ public:
 
     int register_endpoint(std::string addr, int port);
 
-    void send(int dest, size_t method, GenericBuffer&);
+    void send(int dest, GenericBuffer);
 
     void loop();
 

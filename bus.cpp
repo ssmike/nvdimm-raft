@@ -13,8 +13,9 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
-#include <map>
+#include <unordered_set>
 #include <vector>
+#include <queue>
 
 namespace bus {
 
@@ -37,10 +38,17 @@ struct SockaddrCompare {
     }
 };
 
+void set_nodelay(int socket) {
+  int flags = 1;
+  CHECK_ERRNO(
+      setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags)) == 0);
+}
+
 class TcpBus::Impl {
 public:
-    Impl(int port, ConnectPool& pool)
+    Impl(int port, size_t fixed_pool_size, ConnectPool& pool)
         : pool_(pool)
+        , fixed_pool_size_(fixed_pool_size)
     {
       listensock_ = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
                            IPPROTO_TCP);
@@ -57,7 +65,7 @@ public:
       {
           epoll_event evt;
           evt.events = EPOLLIN;
-          evt.data.u64 = 0;
+          evt.data.u64 = kListenId;
           CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, listensock_, &evt));
 
           event_buf_.emplace_back();
@@ -75,6 +83,10 @@ public:
         }
         int result = resolve_map_.size();
         resolve_map_[*addr] = result;
+        if (result >= endpoints_.size()) {
+            endpoints_.resize(result + 1);
+        }
+        endpoints_[result] = *addr;
         return result;
     }
 
@@ -85,16 +97,35 @@ public:
             socklen_t addrlen = sizeof(addr);
             SocketHolder sock(accept4(listensock_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC));
             if (sock.get() >= 0 && addr.sin6_family == AF_INET6 && addrlen == sizeof(addr)) {
-                int flags = 1;
-                CHECK_ERRNO(setsockopt(sock.get(), IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags)) == 0);
-                uint64_t id = add_socket(sock.get(), EPOLLIN | EPOLLOUT | EPOLLET);
-                pool_.add(sock.release(), id, resolve(&addr));
+              set_nodelay(sock.get());
+              uint64_t id = epoll_add(sock.get());
+              pool_.add(sock.release(), id, resolve(&addr));
+              pool_.set_available(id);
             } if (errno == EAGAIN) {
                 return;
             } else  if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
                 pool_.close_old_conns();
             } else if (errno != EINTR) {
                 throw_errno();
+            }
+        }
+    }
+
+    void fix_pool_size(int dest) {
+        if (dest > endpoints_.size()) {
+            throw BusError("invalid endpoint");
+        }
+        size_t pool_size = pool_.count_connections(dest);
+        if (pool_size < fixed_pool_size_) {
+            for (; pool_size < fixed_pool_size_; ++pool_size) {
+                SocketHolder sock = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                CHECK_ERRNO(sock.get() >= 0);
+                sockaddr_in6* addr = &endpoints_[dest];
+                int status = connect(sock.get(), reinterpret_cast<sockaddr*>(addr), sizeof(sockaddr_in6));
+                CHECK_ERRNO(status == 0 || errno == EINPROGRESS || errno == EINTR);
+                set_nodelay(sock.get());
+                uint64_t id = epoll_add(sock.get());
+                pool_.add(sock.release(), id, dest);
             }
         }
     }
@@ -107,21 +138,34 @@ public:
                 uint64_t id = event_buf_[i].data.u64;
                 if (id == kListenId) {
                     accept_conns();
-                } else {
-                    if (event_buf_[i].events | EPOLLIN) {
+                } else if (ConnData* data = pool_.select(id)) {
+                    int dest = data->dest;
+                    if (event_buf_[i].events & EPOLLERR) {
+                        pool_.close(id);
+                        fix_pool_size(dest);
+                        continue;
                     }
-                    if (event_buf_[i].events | EPOLLOUT) {
+                    if (event_buf_[i].events & EPOLLIN) {
+                    }
+                    if (event_buf_[i].events & EPOLLOUT) {
+                        pool_.set_available(id);
                     }
                 }
             }
         }
     }
 
-    uint64_t add_socket(int fd, uint32_t flags) {
+    void send(int dest, GenericBuffer buffer) {
+        fix_pool_size(dest);
+        //TODO
+    }
+
+    uint64_t epoll_add(int fd) {
         epoll_event evt;
-        evt.events = flags;
+        evt.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLET;
         evt.data.u64 = id_++;
         CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, listensock_, &evt));
+        event_buf_.resize(pool_.count_connections() + 1);
         return evt.data.u64;
     }
 
@@ -141,14 +185,16 @@ public:
 
     std::vector<epoll_event> event_buf_;
     ConnectPool& pool_;
+    size_t fixed_pool_size_;
 
     std::unordered_map<sockaddr_in6, int, SockaddrHash, SockaddrCompare> resolve_map_;
-
     std::vector<sockaddr_in6> endpoints_;
+
+    std::unordered_map<int, std::queue<GenericBuffer>> pending_messages_;
 };
 
-TcpBus::TcpBus(int port, ConnectPool& pool)
-    : impl_(new Impl(port, pool))
+TcpBus::TcpBus(int port, size_t fixed_pool_size, ConnectPool& pool)
+    : impl_(new Impl(port, fixed_pool_size, pool))
 {
 }
 
@@ -172,18 +218,22 @@ int TcpBus::register_endpoint(std::string addr, int port) {
     if (res != 0) {
         throw BusError(gai_strerror(res));
     }
-    int result = impl_->resolve_map_.size();
+    int result = -1;
     for (addrinfo* i = info; i != nullptr; i = i->ai_next) {
+        auto addr = reinterpret_cast<sockaddr_in6*>(info->ai_addr);
         if (info->ai_family == AF_INET6) {
-            impl_->resolve_map_[*reinterpret_cast<sockaddr_in6*>(info->ai_addr)] = result;
+            if (result < 0) {
+                result = impl_->resolve(addr);
+            }
+            impl_->resolve_map_[*addr] = result;
         }
     }
     freeaddrinfo(info);
     return result;
 }
 
-void TcpBus::send(int dest, size_t method, GenericBuffer&) {
-    //TODO
+void TcpBus::send(int dest, GenericBuffer buffer) {
+    impl_->send(dest, buffer);
 }
 
 void TcpBus::loop() {

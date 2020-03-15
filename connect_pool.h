@@ -10,7 +10,7 @@ using GenericBuffer = std::vector<char, std::allocator<char>>;
 
 class SocketHolder {
 public:
-    explicit SocketHolder(int sock): sock_(sock) {}
+    SocketHolder(int sock): sock_(sock) {}
     SocketHolder(): SocketHolder(kInvalidSocket) {}
 
     SocketHolder(const SocketHolder&) = delete;
@@ -39,25 +39,26 @@ private:
 };
 
 struct ConnData {
-    enum State {
-        kReading = 0,
-        kWriting = 1,
-        kIdle = 2,
-    } state;
-
     GenericBuffer& in_buf;
     GenericBuffer& out_buf;
     SocketHolder socket;
+
+    int dest;
 };
 
 class ConnectPool {
 public:
     ConnectPool();
 
-    void add(int fd, uint64_t id, int hint);
+    void add(SocketHolder, uint64_t id, int hint);
 
     ConnData* select(uint64_t);
     ConnData* select(int hint);
+
+    void set_available(uint64_t);
+
+    size_t count_connections(int hint);
+    size_t count_connections();
 
     void close(uint64_t);
     void close_old_conns();
