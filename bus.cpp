@@ -149,12 +149,13 @@ public:
                         }
                     }
                     if (data && (event_buf_[i].events & EPOLLOUT) != 0) {
-                        if (!data->egr_message) {
-                            data->egr_message = pending_messages_[dest].front();
-                            data->egr_offset = 0;
-                            pending_messages_[dest].pop();
+                        while (try_write_message(data)) {
+                            if (!data->egr_message) {
+                                data->egr_message = pending_messages_[dest].front();
+                                data->egr_offset = 0;
+                                pending_messages_[dest].pop();
+                            }
                         }
-                        try_write_message(data);
                     }
                 }
             }
@@ -198,8 +199,9 @@ public:
                     data->egr_message.reset();
                     pool_.set_available(data->id);
                 }
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return true;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return false;
             } else if (errno == EINTR) {
                 continue;
             } else {
