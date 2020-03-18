@@ -119,10 +119,39 @@ public:
                         continue;
                     }
                     if (event_buf_[i].events & EPOLLIN) {
+                        ssize_t message_size = std::numeric_limits<ssize_t>::lowest();
+                        while (true) {
+                            size_t expected = 0;
+                            if (data->ingr_offset < header_len) {
+                                expected = header_len;
+                            } else {
+                                expected = read_header(data->ingr_buf.get().data()) + header_len;
+                            }
+                            data->ingr_buf.get().resize(data->ingr_offset + expected);
+                            ssize_t res = read(data->socket.get(), data->ingr_buf.get().data() + data->ingr_offset, expected);
+                            if (res >= 0) {
+                                data->ingr_offset += res;
+                                if (header_len + message_size == data->ingr_offset) {
+                                    handler_(dest, SharedView(std::move(data->ingr_buf)).skip(header_len));
+                                    data->ingr_buf = ScopedBuffer(buffer_pool_);
+                                    data->ingr_offset = 0;
+                                    continue;
+                                }
+                            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                break;
+                            } else if (errno == EINTR) {
+                                continue;
+                            } else {
+                                pool_.close(id);
+                                data = nullptr;
+                                break;
+                            }
+                        }
                     }
-                    if (event_buf_[i].events & EPOLLOUT) {
+                    if (data && (event_buf_[i].events & EPOLLOUT) != 0) {
                         if (!data->egr_message) {
                             data->egr_message = pending_messages_[dest].front();
+                            data->egr_offset = 0;
                             pending_messages_[dest].pop();
                         }
                         try_write_message(data);
@@ -166,6 +195,7 @@ public:
             if (res >= 0) {
                 data->egr_offset += res;
                 if (data->egr_offset == header_len + data->egr_message->size()) {
+                    data->egr_message.reset();
                     pool_.set_available(data->id);
                 }
             } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -184,6 +214,7 @@ public:
         fix_pool_size(dest);
         if (auto data = pool_.select(dest)) {
             data->egr_message = std::move(message);
+            data->egr_offset = 0;
             try_write_message(data);
         }
     }

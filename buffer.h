@@ -52,7 +52,7 @@ class ScopedBuffer {
 public:
     ScopedBuffer(BufferPool& pool)
         : buf_(pool.take())
-        , pool_(pool)
+        , pool_(&pool)
     {
     }
 
@@ -66,17 +66,22 @@ public:
         other.buf_ = BufferPool::kInvalidBuffer;
     }
 
+    void operator = (ScopedBuffer&& other) {
+        std::swap(pool_, other.pool_);
+        std::swap(buf_, other.buf_);
+    }
+
     GenericBuffer& get() {
-        return pool_.get(buf_);
+        return pool_->get(buf_);
     }
 
     ~ScopedBuffer() {
-        pool_.put(buf_);
+        pool_->put(buf_);
     }
 
 private:
     size_t buf_ = BufferPool::kInvalidBuffer;
-    BufferPool& pool_;
+    BufferPool* pool_ = nullptr;
 };
 
 class SharedView {

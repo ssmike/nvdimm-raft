@@ -48,7 +48,9 @@ struct ConnData {
     std::optional<SharedView> egr_message;
     uint64_t egr_offset = 0;
 
-    ScopedBuffer in_buf;
+    ScopedBuffer ingr_buf;
+    size_t ingr_offset = 0;
+
     SocketHolder socket;
 
     int dest;
