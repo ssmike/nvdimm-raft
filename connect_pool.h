@@ -1,6 +1,9 @@
 #pragma once
 
 #include "fwd.h"
+#include "buffer.h"
+
+#include <optional>
 #include <stdint.h>
 #include <cstddef>
 #include <utility>
@@ -42,11 +45,14 @@ private:
 };
 
 struct ConnData {
-    GenericBuffer& in_buf;
-    GenericBuffer& out_buf;
+    std::optional<SharedView> egr_message;
+    uint64_t egr_offset = 0;
+
+    ScopedBuffer in_buf;
     SocketHolder socket;
 
     int dest;
+    uint64_t id;
 };
 
 class ConnectPool {

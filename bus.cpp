@@ -2,6 +2,7 @@
 
 #include "error.h"
 
+#include <sys/uio.h>
 #include <string.h>
 #include <netdb.h>
 #include <sys/types.h>
@@ -20,6 +21,23 @@
 #include <queue>
 
 namespace bus {
+
+constexpr size_t header_len = 8;
+
+void write_header(size_t size, char* buf) {
+    for (size_t i = 0; i < header_len; ++i) {
+        buf[i] = size & 255;
+        size /= 256;
+    }
+}
+
+size_t read_header(char* buf) {
+    size_t result = 0;
+    for (size_t i = 0; i < header_len; ++i) {
+        result = result * 256 + size_t(buf[i]);
+    }
+    return result;
+}
 
 class TcpBus::Impl {
 public:
@@ -103,16 +121,71 @@ public:
                     if (event_buf_[i].events & EPOLLIN) {
                     }
                     if (event_buf_[i].events & EPOLLOUT) {
-                        pool_.set_available(id);
+                        if (!data->egr_message) {
+                            data->egr_message = pending_messages_[dest].front();
+                            pending_messages_[dest].pop();
+                        }
+                        try_write_message(data);
                     }
                 }
             }
         }
     }
 
-    void send(int dest, SharedView buffer) {
+    bool try_write_message(ConnData* data) {
+        if (!data->egr_message) {
+            return true;
+        }
+
+        int fd = data->dest;
+
+        char header[header_len];
+        write_header(data->egr_message->size(), header);
+
+        while (true) {
+            iovec iov_holder[2];
+            iov_holder[0] = {.iov_base = header, .iov_len = header_len};
+            iov_holder[1] = {.iov_base = (void*)data->egr_message->data(), .iov_len = data->egr_message->size()};
+
+            iovec* iov = iov_holder;
+            int iovcnt = 2;
+            size_t offset = data->egr_offset;
+
+            while (iovcnt > 0 && offset > iov[0].iov_len) {
+                offset -= iov[0].iov_len;
+                ++iov;
+            }
+            if (iovcnt == 0) {
+                return 0;
+            }
+            if (offset > 0) {
+                iov[0].iov_base = ((char*)iov[0].iov_base) + offset;
+                iov[0].iov_len -= offset;
+            }
+            ssize_t res = writev(fd, iov, iovcnt);
+            if (res >= 0) {
+                data->egr_offset += res;
+                if (data->egr_offset == header_len + data->egr_message->size()) {
+                    pool_.set_available(data->id);
+                }
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true;
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                pending_messages_[data->dest].push(std::move(*data->egr_message));
+                pool_.close(data->id);
+                return false;
+            }
+        }
+    }
+
+    void send(int dest, SharedView message) {
         fix_pool_size(dest);
-        //TODO
+        if (auto data = pool_.select(dest)) {
+            data->egr_message = std::move(message);
+            try_write_message(data);
+        }
     }
 
     uint64_t epoll_add(int fd) {
@@ -138,7 +211,7 @@ public:
 
     EndpointManager& endpoint_manager_;
 
-    std::unordered_map<int, std::queue<ScopedBuffer>> pending_messages_;
+    std::unordered_map<int, std::queue<SharedView>> pending_messages_;
 
     BufferPool& buffer_pool_;
 };

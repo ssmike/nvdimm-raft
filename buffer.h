@@ -88,13 +88,13 @@ public:
 
     SharedView(const SharedView&) = default;
 
-    SharedView slice(size_t start, size_t size) {
+    SharedView slice(size_t start, size_t size) const {
         SharedView result = *this;
         result.view_ = { view_.data() + start, size };
         return result;
     }
 
-    SharedView skip(size_t start) {
+    SharedView skip(size_t start) const {
         return slice(start, get().size() - start);
     }
 
@@ -102,7 +102,15 @@ public:
         return slice(0, size);
     }
 
-    std::string_view get() {
+    const char* data() const {
+        return view_.data();
+    }
+
+    size_t size() const {
+        return view_.size();
+    }
+
+    std::string_view get() const {
         return view_;
     }
 
