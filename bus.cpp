@@ -85,7 +85,7 @@ public:
             } if (conn.errno_ == EAGAIN) {
                 return;
             } else  if (conn.errno_ == EMFILE || conn.errno_ == ENFILE || conn.errno_ == ENOBUFS || conn.errno_ == ENOMEM) {
-                pool_.close_old_conns();
+                pool_.close_old_conns(2);
             } else if (conn.errno_ != EINTR) {
                 throw_errno();
             }
@@ -122,19 +122,19 @@ public:
                         ssize_t message_size = std::numeric_limits<ssize_t>::lowest();
                         while (true) {
                             size_t expected = 0;
-                            if (data->ingr_offset < header_len) {
+                            if (data->ingress_offset < header_len) {
                                 expected = header_len;
                             } else {
-                                expected = read_header(data->ingr_buf.get().data()) + header_len;
+                                expected = read_header(data->ingress_buf.get().data()) + header_len;
                             }
-                            data->ingr_buf.get().resize(data->ingr_offset + expected);
-                            ssize_t res = read(data->socket.get(), data->ingr_buf.get().data() + data->ingr_offset, expected);
+                            data->ingress_buf.get().resize(data->ingress_offset + expected);
+                            ssize_t res = read(data->socket.get(), data->ingress_buf.get().data() + data->ingress_offset, expected);
                             if (res >= 0) {
-                                data->ingr_offset += res;
-                                if (header_len + message_size == data->ingr_offset) {
-                                    handler_(dest, SharedView(std::move(data->ingr_buf)).skip(header_len));
-                                    data->ingr_buf = ScopedBuffer(buffer_pool_);
-                                    data->ingr_offset = 0;
+                                data->ingress_offset += res;
+                                if (header_len + message_size == data->ingress_offset) {
+                                    handler_(dest, SharedView(std::move(data->ingress_buf)).skip(header_len));
+                                    data->ingress_buf = ScopedBuffer(buffer_pool_);
+                                    data->ingress_offset = 0;
                                     continue;
                                 }
                             } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -150,9 +150,9 @@ public:
                     }
                     if (data && (event_buf_[i].events & EPOLLOUT) != 0) {
                         while (try_write_message(data)) {
-                            if (!data->egr_message) {
-                                data->egr_message = pending_messages_[dest].front();
-                                data->egr_offset = 0;
+                            if (!data->egress_message) {
+                                data->egress_message = pending_messages_[dest].front();
+                                data->egress_offset = 0;
                                 pending_messages_[dest].pop();
                             }
                         }
@@ -163,23 +163,23 @@ public:
     }
 
     bool try_write_message(ConnData* data) {
-        if (!data->egr_message) {
+        if (!data->egress_message) {
             return true;
         }
 
         int fd = data->dest;
 
         char header[header_len];
-        write_header(data->egr_message->size(), header);
+        write_header(data->egress_message->size(), header);
 
         while (true) {
             iovec iov_holder[2];
             iov_holder[0] = {.iov_base = header, .iov_len = header_len};
-            iov_holder[1] = {.iov_base = (void*)data->egr_message->data(), .iov_len = data->egr_message->size()};
+            iov_holder[1] = {.iov_base = (void*)data->egress_message->data(), .iov_len = data->egress_message->size()};
 
             iovec* iov = iov_holder;
             int iovcnt = 2;
-            size_t offset = data->egr_offset;
+            size_t offset = data->egress_offset;
 
             while (iovcnt > 0 && offset > iov[0].iov_len) {
                 offset -= iov[0].iov_len;
@@ -194,9 +194,9 @@ public:
             }
             ssize_t res = writev(fd, iov, iovcnt);
             if (res >= 0) {
-                data->egr_offset += res;
-                if (data->egr_offset == header_len + data->egr_message->size()) {
-                    data->egr_message.reset();
+                data->egress_offset += res;
+                if (data->egress_offset == header_len + data->egress_message->size()) {
+                    data->egress_message.reset();
                     pool_.set_available(data->id);
                 }
                 return true;
@@ -205,7 +205,7 @@ public:
             } else if (errno == EINTR) {
                 continue;
             } else {
-                pending_messages_[data->dest].push(std::move(*data->egr_message));
+                pending_messages_[data->dest].push(std::move(*data->egress_message));
                 pool_.close(data->id);
                 return false;
             }
@@ -214,9 +214,9 @@ public:
 
     void send(int dest, SharedView message) {
         fix_pool_size(dest);
-        if (auto data = pool_.select(dest)) {
-            data->egr_message = std::move(message);
-            data->egr_offset = 0;
+        if (auto data = pool_.take_available(dest)) {
+            data->egress_message = std::move(message);
+            data->egress_offset = 0;
             try_write_message(data);
         }
     }
@@ -269,5 +269,7 @@ void TcpBus::send(int dest, SharedView buffer) {
 void TcpBus::loop() {
     impl_->loop();
 }
+
+TcpBus::~TcpBus() = default;
 
 };

@@ -45,11 +45,12 @@ private:
 };
 
 struct ConnData {
-    std::optional<SharedView> egr_message;
-    uint64_t egr_offset = 0;
+    // doesn't include header
+    std::optional<SharedView> egress_message;
+    uint64_t egress_offset = 0;
 
-    ScopedBuffer ingr_buf;
-    size_t ingr_offset = 0;
+    ScopedBuffer ingress_buf;
+    size_t ingress_offset = 0;
 
     SocketHolder socket;
 
@@ -63,20 +64,26 @@ public:
 
     size_t make_id();
 
-    void add(SocketHolder, uint64_t id, int hint);
+    void add(SocketHolder, uint64_t id, int dest);
 
     ConnData* select(uint64_t);
-    ConnData* select(int hint);
+    
+    // makes unavailable
+    ConnData* take_available(int dest);
 
     void set_available(uint64_t);
 
-    size_t count_connections(int hint);
+    size_t count_connections(int dest);
     size_t count_connections();
 
     void close(uint64_t);
-    void close_old_conns();
+    void close_old_conns(size_t cnt);
+
+    ~ConnectPool();
 
 private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }
