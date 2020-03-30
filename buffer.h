@@ -50,6 +50,8 @@ private:
 
 class ScopedBuffer {
 public:
+    ScopedBuffer() = default;
+
     ScopedBuffer(BufferPool& pool)
         : buf_(pool.take())
         , pool_(&pool)
@@ -76,7 +78,9 @@ public:
     }
 
     ~ScopedBuffer() {
-        pool_->put(buf_);
+        if (pool_) {
+            pool_->put(buf_);
+        }
     }
 
 private:

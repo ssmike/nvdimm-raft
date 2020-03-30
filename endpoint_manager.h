@@ -26,6 +26,8 @@ public:
     SocketHolder async_connect(int dest);
     IncomingConnection accept(int listen_socket);
 
+    ~EndpointManager();
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

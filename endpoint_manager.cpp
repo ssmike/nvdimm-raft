@@ -126,4 +126,6 @@ EndpointManager::IncomingConnection EndpointManager::accept(int listen_socket) {
     return impl_->accept(listen_socket);
 }
 
+EndpointManager::~EndpointManager() = default;
+
 }

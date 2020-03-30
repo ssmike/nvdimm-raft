@@ -21,6 +21,8 @@ add_executable(main main.cpp
     ${PROTO_SRCS}
     ${PROTO_HDRS})
 
+set_property(TARGET main PROPERTY CXX_STANDARD 17)
+
 target_include_directories( main PUBLIC)
 
 target_link_libraries(main ${Protobuf_LIBRARIES} bus)
