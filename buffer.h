@@ -93,6 +93,7 @@ public:
     SharedView(ScopedBuffer buf) {
         std::unique_ptr<ScopedBuffer> ptr(new ScopedBuffer(std::move(buf)));
         buf_ = std::move(ptr);
+        view_ = {buf_->get().data(), buf_->get().size()};
     }
 
     SharedView(const SharedView&) = default;

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "buffer.h"
-#include "connect_pool.h"
 #include "endpoint_manager.h"
 #include <memory>
 #include "fwd.h"
@@ -14,6 +13,7 @@ public:
         int port = 80;
         size_t fixed_pool_size = 6;
         size_t listener_backlog = 60;
+        size_t max_message_size = 4098;
     };
 
 public:

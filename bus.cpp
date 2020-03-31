@@ -33,7 +33,7 @@ void write_header(size_t size, char* buf) {
 
 size_t read_header(char* buf) {
     size_t result = 0;
-    for (size_t i = 0; i < header_len; ++i) {
+    for (ssize_t i = header_len - 1; i >= 0; --i) {
         result = result * 256 + size_t(buf[i]);
     }
     return result;
@@ -45,6 +45,7 @@ public:
         : fixed_pool_size_(opts.fixed_pool_size)
         , buffer_pool_(buffer_pool)
         , endpoint_manager_(endpoint_manager)
+        , max_message_size_(opts.max_message_size)
     {
       listensock_ = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
                            IPPROTO_TCP);
@@ -115,16 +116,22 @@ public:
         ssize_t message_size = std::numeric_limits<ssize_t>::lowest();
         while (true) {
             size_t expected = 0;
+            bool has_header = false;
             if (data->ingress_offset < header_len) {
                 expected = header_len;
             } else {
                 expected = read_header(data->ingress_buf.get().data()) + header_len;
+                has_header = true;
             }
-            data->ingress_buf.get().resize(data->ingress_offset + expected);
+            if (expected > max_message_size_) {
+                throw BusError("too big message");
+            }
+            data->ingress_buf.get().resize(expected);
+            expected -= data->ingress_offset;
             ssize_t res = read(data->socket.get(), data->ingress_buf.get().data() + data->ingress_offset, expected);
             if (res >= 0) {
                 data->ingress_offset += res;
-                if (header_len + message_size == data->ingress_offset) {
+                if (has_header && res == expected) {
                     handler_(data->dest, SharedView(std::move(data->ingress_buf)).skip(header_len));
                     data->ingress_buf = ScopedBuffer(buffer_pool_);
                     data->ingress_offset = 0;
@@ -159,7 +166,10 @@ public:
     void loop() {
         while (true) {
             int ready = epoll_wait(epollfd_, event_buf_.data(), event_buf_.size(), -1);
-            CHECK_ERRNO(ready >= 0 || errno == EINTR);
+            if (errno == EINTR) {
+                continue;
+            }
+            CHECK_ERRNO(ready >= 0);
             for (size_t i = 0; i < ready; ++i) {
                 uint64_t id = event_buf_[i].data.u64;
                 if (id == listend_id_) {
@@ -267,6 +277,8 @@ public:
 
     BufferPool& buffer_pool_;
     EndpointManager& endpoint_manager_;
+
+    size_t max_message_size_;
 };
 
 TcpBus::TcpBus(Options opts, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
