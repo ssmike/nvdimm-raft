@@ -76,7 +76,6 @@ public:
 
     void accept_conns() {
         for (size_t i = 0; i < 2; ++i) {
-            if (throttler_ && !throttler_->accept_connection()) return;
             EndpointManager::IncomingConnection conn = endpoint_manager_.accept(listensock_);
             if (conn.sock_.get() >= 0) {
                 uint64_t id = epoll_add(conn.sock_.get());
@@ -231,7 +230,6 @@ public:
     }
 
 public:
-    Throttler* throttler_ = nullptr;
     std::function<void(int, SharedView)> handler_;
 
     int epollfd_;
@@ -242,20 +240,15 @@ public:
     ConnectPool& pool_;
     size_t fixed_pool_size_;
 
-    EndpointManager& endpoint_manager_;
-
     std::unordered_map<int, std::queue<SharedView>> pending_messages_;
 
     BufferPool& buffer_pool_;
+    EndpointManager& endpoint_manager_;
 };
 
 TcpBus::TcpBus(int port, size_t fixed_pool_size, ConnectPool& pool, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
     : impl_(new Impl(port, fixed_pool_size, pool, buffer_pool, endpoint_manager))
 {
-}
-
-void TcpBus::set_throttler(Throttler& t) {
-    impl_->throttler_ = &t;
 }
 
 void TcpBus::set_handler(std::function<void(int, SharedView)> handler) {

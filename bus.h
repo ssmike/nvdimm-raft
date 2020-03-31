@@ -8,18 +8,9 @@
 
 namespace bus {
 
-class Throttler {
-public:
-    virtual bool accept_connection() = 0;
-
-    virtual bool accept_request() = 0;
-};
-
 class TcpBus {
 public:
     TcpBus(int port, size_t fixed_pool_size, ConnectPool&, BufferPool&, EndpointManager&);
-
-    void set_throttler(Throttler&);
 
     void set_handler(std::function<void(int, SharedView)>);
 
