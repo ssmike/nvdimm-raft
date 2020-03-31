@@ -16,7 +16,7 @@ public:
     static constexpr size_t kInvalidBuffer = std::numeric_limits<size_t>::max();
 
 public:
-    BufferPool(int start_size, int capacity)
+    BufferPool(int start_size)
         : start_size_(start_size)
     {
     }

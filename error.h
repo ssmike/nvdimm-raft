@@ -7,19 +7,17 @@ namespace bus {
 
 class BusError: public std::exception {
 public:
-    BusError(const char*);
+    BusError(std::string s) : message_(std::move(s)) {}
 
     const char* what() const noexcept override {
-        return message_;
+        return message_.c_str();
     }
 
 private:
-    const char* message_;
+    std::string message_;
 };
 
-void throw_errno() {
-    throw BusError(strerror(errno));
-}
+void throw_errno();
 
 #define CHECK_ERRNO(x) if (!(x)) throw_errno();
 

@@ -41,20 +41,28 @@ size_t read_header(char* buf) {
 
 class TcpBus::Impl {
 public:
-    Impl(int port, size_t fixed_pool_size, ConnectPool& pool, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
-        : pool_(pool)
-        , fixed_pool_size_(fixed_pool_size)
+    Impl(bus::TcpBus::Options opts, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
+        : fixed_pool_size_(opts.fixed_pool_size)
         , buffer_pool_(buffer_pool)
         , endpoint_manager_(endpoint_manager)
     {
       listensock_ = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
                            IPPROTO_TCP);
       CHECK_ERRNO(listensock_ >= 0);
+
+      {
+          int optval = 1;
+          setsockopt(listensock_, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+      }
+
       sockaddr_in6 addr;
+      addr.sin6_family = AF_INET6;
       addr.sin6_addr = in6addr_any;
-      addr.sin6_port = htons(port);
+      addr.sin6_port = htons(opts.port);
       CHECK_ERRNO(bind(listensock_, reinterpret_cast<struct sockaddr *>(&addr),
-                       sizeof(addr)));
+                       sizeof(addr)) == 0);
+
+      CHECK_ERRNO(listen(listensock_, opts.listener_backlog) == 0);
 
       epollfd_ = epoll_create1(EPOLL_CLOEXEC);
       CHECK_ERRNO(epollfd_ >= 0);
@@ -63,7 +71,7 @@ public:
           epoll_event evt;
           evt.events = EPOLLIN;
           evt.data.u64 = listend_id_ = pool_.make_id();
-          CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, listensock_, &evt));
+          CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, listensock_, &evt) == 0);
 
           event_buf_.emplace_back();
       }
@@ -81,7 +89,8 @@ public:
                 uint64_t id = epoll_add(conn.sock_.get());
                 pool_.add(conn.sock_.release(), id, conn.endpoint_);
                 pool_.set_available(id);
-            } if (conn.errno_ == EAGAIN) {
+                pool_.select(id)->ingress_buf = ScopedBuffer(buffer_pool_);
+            } else if (conn.errno_ == EAGAIN) {
                 return;
             } else  if (conn.errno_ == EMFILE || conn.errno_ == ENFILE || conn.errno_ == ENOBUFS || conn.errno_ == ENOMEM) {
                 pool_.close_old_conns(2);
@@ -102,6 +111,51 @@ public:
         }
     }
 
+    void handle_read(ConnData* data) {
+        ssize_t message_size = std::numeric_limits<ssize_t>::lowest();
+        while (true) {
+            size_t expected = 0;
+            if (data->ingress_offset < header_len) {
+                expected = header_len;
+            } else {
+                expected = read_header(data->ingress_buf.get().data()) + header_len;
+            }
+            data->ingress_buf.get().resize(data->ingress_offset + expected);
+            ssize_t res = read(data->socket.get(), data->ingress_buf.get().data() + data->ingress_offset, expected);
+            if (res >= 0) {
+                data->ingress_offset += res;
+                if (header_len + message_size == data->ingress_offset) {
+                    handler_(data->dest, SharedView(std::move(data->ingress_buf)).skip(header_len));
+                    data->ingress_buf = ScopedBuffer(buffer_pool_);
+                    data->ingress_offset = 0;
+                    continue;
+                }
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                pool_.close(data->id);
+                data = nullptr;
+                break;
+            }
+        }
+    }
+
+    void handle_write(ConnData* data) {
+        do {
+            if (!data->egress_message) {
+                auto& queue = pending_messages_[data->dest];
+                if (queue.empty()) {
+                    return;
+                }
+                data->egress_message = queue.front();
+                data->egress_offset = 0;
+                pending_messages_[data->dest].pop();
+            }
+        } while (try_write_message(data));
+    }
+
     void loop() {
         while (true) {
             int ready = epoll_wait(epollfd_, event_buf_.data(), event_buf_.size(), -1);
@@ -118,43 +172,10 @@ public:
                         continue;
                     }
                     if (event_buf_[i].events & EPOLLIN) {
-                        ssize_t message_size = std::numeric_limits<ssize_t>::lowest();
-                        while (true) {
-                            size_t expected = 0;
-                            if (data->ingress_offset < header_len) {
-                                expected = header_len;
-                            } else {
-                                expected = read_header(data->ingress_buf.get().data()) + header_len;
-                            }
-                            data->ingress_buf.get().resize(data->ingress_offset + expected);
-                            ssize_t res = read(data->socket.get(), data->ingress_buf.get().data() + data->ingress_offset, expected);
-                            if (res >= 0) {
-                                data->ingress_offset += res;
-                                if (header_len + message_size == data->ingress_offset) {
-                                    handler_(dest, SharedView(std::move(data->ingress_buf)).skip(header_len));
-                                    data->ingress_buf = ScopedBuffer(buffer_pool_);
-                                    data->ingress_offset = 0;
-                                    continue;
-                                }
-                            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                break;
-                            } else if (errno == EINTR) {
-                                continue;
-                            } else {
-                                pool_.close(id);
-                                data = nullptr;
-                                break;
-                            }
-                        }
+                        handle_read(data);
                     }
                     if (data && (event_buf_[i].events & EPOLLOUT) != 0) {
-                        while (try_write_message(data)) {
-                            if (!data->egress_message) {
-                                data->egress_message = pending_messages_[dest].front();
-                                data->egress_offset = 0;
-                                pending_messages_[dest].pop();
-                            }
-                        }
+                        handle_write(data);
                     }
                 }
             }
@@ -166,7 +187,7 @@ public:
             return true;
         }
 
-        int fd = data->dest;
+        int fd = data->socket.get();
 
         char header[header_len];
         write_header(data->egress_message->size(), header);
@@ -217,6 +238,8 @@ public:
             data->egress_message = std::move(message);
             data->egress_offset = 0;
             try_write_message(data);
+        } else {
+            pending_messages_[dest].push(std::move(message));
         }
     }
 
@@ -224,7 +247,7 @@ public:
         epoll_event evt;
         evt.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLET;
         evt.data.u64 = pool_.make_id();
-        CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, listensock_, &evt));
+        CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, fd, &evt) == 0);
         event_buf_.resize(pool_.count_connections() + 1);
         return evt.data.u64;
     }
@@ -237,7 +260,7 @@ public:
     size_t listend_id_;
 
     std::vector<epoll_event> event_buf_;
-    ConnectPool& pool_;
+    ConnectPool pool_;
     size_t fixed_pool_size_;
 
     std::unordered_map<int, std::queue<SharedView>> pending_messages_;
@@ -246,8 +269,8 @@ public:
     EndpointManager& endpoint_manager_;
 };
 
-TcpBus::TcpBus(int port, size_t fixed_pool_size, ConnectPool& pool, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
-    : impl_(new Impl(port, fixed_pool_size, pool, buffer_pool, endpoint_manager))
+TcpBus::TcpBus(Options opts, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
+    : impl_(new Impl(opts, buffer_pool, endpoint_manager))
 {
 }
 

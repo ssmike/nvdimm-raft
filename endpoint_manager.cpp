@@ -89,25 +89,24 @@ EndpointManager::EndpointManager()
 }
 
 int EndpointManager::register_endpoint(std::string addr, int port) {
-    std::string service;
-    std::stringstream ss;
-    ss << port;
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET6;
+    hints.ai_protocol = IPPROTO_TCP;
     struct addrinfo* info;
-    int res = getaddrinfo(addr.c_str(), service.c_str(), &hints, &info);
+    int res = getaddrinfo(addr.c_str(), nullptr, &hints, &info);
     if (res != 0) {
         throw BusError(gai_strerror(res));
     }
     std::optional<int> result = std::nullopt;
     for (addrinfo* i = info; i != nullptr; i = i->ai_next) {
-        auto addr = reinterpret_cast<sockaddr_in6*>(info->ai_addr);
+        sockaddr_in6 addr = *reinterpret_cast<sockaddr_in6*>(info->ai_addr);
+        addr.sin6_port = htons(port);
         if (info->ai_family == AF_INET6) {
             if (!result) {
-                result = impl_->resolve(addr);
+                result = impl_->resolve(&addr);
             }
-            impl_->resolve_map_[*addr] = result.value();
+            impl_->resolve_map_[addr] = result.value();
         }
     }
     freeaddrinfo(info);

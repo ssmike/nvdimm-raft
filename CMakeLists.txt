@@ -13,16 +13,20 @@ protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS messages.proto)
 add_library(bus
     bus.h bus.cpp
     connect_pool.h connect_pool.cpp
-    endpoint_manager.h endpoint_manager.cpp)
+    endpoint_manager.h endpoint_manager.cpp
+    error.h error.cpp
+    util.h)
 
 set_property(TARGET bus PROPERTY CXX_STANDARD 17)
 
-add_executable(main main.cpp
+add_executable(testBus testBus.cpp
     ${PROTO_SRCS}
     ${PROTO_HDRS})
 
-set_property(TARGET main PROPERTY CXX_STANDARD 17)
+set_property(TARGET testBus PROPERTY CXX_STANDARD 17)
 
-target_include_directories( main PUBLIC)
+add_test(NAME bus COMMAND testBus)
 
-target_link_libraries(main ${Protobuf_LIBRARIES} bus)
+#target_include_directories( main PUBLIC)
+
+target_link_libraries(testBus ${Protobuf_LIBRARIES} bus)

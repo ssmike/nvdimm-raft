@@ -10,7 +10,14 @@ namespace bus {
 
 class TcpBus {
 public:
-    TcpBus(int port, size_t fixed_pool_size, ConnectPool&, BufferPool&, EndpointManager&);
+    struct Options {
+        int port = 80;
+        size_t fixed_pool_size = 6;
+        size_t listener_backlog = 60;
+    };
+
+public:
+    TcpBus(Options, BufferPool&, EndpointManager&);
 
     void set_handler(std::function<void(int, SharedView)>);
 

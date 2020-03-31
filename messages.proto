@@ -4,9 +4,3 @@ message Operation {
     bytes key = 1;
     bytes data = 2;
 }
-
-message AddOperationMsg {
-}
-
-service MyService {
-}
