@@ -4,6 +4,7 @@
 #include <mutex>
 #include <atomic>
 
+namespace bus::internal {
 
 class Event {
 public:
@@ -88,3 +89,11 @@ private:
     T value_;
     std::mutex mutex_;
 };
+
+constexpr size_t header_len = 8;
+
+void write_header(size_t size, char* buf);
+
+size_t read_header(char* buf);
+
+}

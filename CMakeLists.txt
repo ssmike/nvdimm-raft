@@ -8,14 +8,14 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
 
-protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS messages.proto)
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS messages.proto service.proto)
 
 add_library(bus
     bus.h bus.cpp
     connect_pool.h connect_pool.cpp
     endpoint_manager.h endpoint_manager.cpp
     error.h error.cpp
-    util.h)
+    util.h util.cpp)
 
 set_property(TARGET bus PROPERTY CXX_STANDARD 17)
 

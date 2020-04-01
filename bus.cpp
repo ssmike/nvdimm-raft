@@ -1,4 +1,5 @@
 #include "bus.h"
+#include "util.h"
 
 #include "error.h"
 
@@ -11,8 +12,6 @@
 #include <netinet/tcp.h>
 #include <unistd.h>
 
-#include <string_view>
-#include <sstream>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -21,23 +20,6 @@
 #include <queue>
 
 namespace bus {
-
-constexpr size_t header_len = 8;
-
-void write_header(size_t size, char* buf) {
-    for (size_t i = 0; i < header_len; ++i) {
-        buf[i] = size & 255;
-        size /= 256;
-    }
-}
-
-size_t read_header(char* buf) {
-    size_t result = 0;
-    for (ssize_t i = header_len - 1; i >= 0; --i) {
-        result = result * 256 + size_t(buf[i]);
-    }
-    return result;
-}
 
 class TcpBus::Impl {
 public:
@@ -117,10 +99,10 @@ public:
         while (true) {
             size_t expected = 0;
             bool has_header = false;
-            if (data->ingress_offset < header_len) {
-                expected = header_len;
+            if (data->ingress_offset < internal::header_len) {
+                expected = internal::header_len;
             } else {
-                expected = read_header(data->ingress_buf.get().data()) + header_len;
+                expected = internal::read_header(data->ingress_buf.get().data()) + internal::header_len;
                 has_header = true;
             }
             if (expected > max_message_size_) {
@@ -132,7 +114,7 @@ public:
             if (res >= 0) {
                 data->ingress_offset += res;
                 if (has_header && res == expected) {
-                    handler_(data->dest, SharedView(std::move(data->ingress_buf)).skip(header_len));
+                    handler_(data->dest, SharedView(std::move(data->ingress_buf)).skip(internal::header_len));
                     data->ingress_buf = ScopedBuffer(buffer_pool_);
                     data->ingress_offset = 0;
                     continue;
@@ -199,12 +181,12 @@ public:
 
         int fd = data->socket.get();
 
-        char header[header_len];
-        write_header(data->egress_message->size(), header);
+        char header[internal::header_len];
+        internal::write_header(data->egress_message->size(), header);
 
         while (true) {
             iovec iov_holder[2];
-            iov_holder[0] = {.iov_base = header, .iov_len = header_len};
+            iov_holder[0] = {.iov_base = header, .iov_len = internal::header_len};
             iov_holder[1] = {.iov_base = (void*)data->egress_message->data(), .iov_len = data->egress_message->size()};
 
             iovec* iov = iov_holder;
@@ -225,7 +207,7 @@ public:
             ssize_t res = writev(fd, iov, iovcnt);
             if (res >= 0) {
                 data->egress_offset += res;
-                if (data->egress_offset == header_len + data->egress_message->size()) {
+                if (data->egress_offset == internal::header_len + data->egress_message->size()) {
                     data->egress_message.reset();
                     pool_.set_available(data->id);
                 }
