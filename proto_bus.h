@@ -11,7 +11,7 @@
 
 namespace bus {
 
-class Service {
+class ProtoBus {
 public:
     template<typename ResponseProto>
     class ResponseHandle {
@@ -46,7 +46,7 @@ public:
     };
 
 public:
-    Service(TcpBus& bus, BufferPool& pool)
+    ProtoBus(TcpBus& bus, BufferPool& pool)
         : pool_(pool)
         , bus_(bus)
     {
