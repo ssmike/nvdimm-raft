@@ -1,9 +1,15 @@
 syntax = "proto3";
 
-package service.detail;
+package bus.detail;
 
 message Message {
+    enum Type {
+        REQUEST = 0;
+        RESPONSE = 1;
+    }
     uint64 seq_id = 1;
-    uint64 type = 2;
-    bytes data = 3;
+    Type type = 2;
+
+    uint32 method = 3;
+    bytes data = 4;
 }

@@ -24,9 +24,18 @@ add_executable(testBus testBus.cpp
     ${PROTO_HDRS})
 
 set_property(TARGET testBus PROPERTY CXX_STANDARD 17)
+target_link_libraries(testBus ${Protobuf_LIBRARIES} bus)
+
+add_executable(testService testBus.cpp
+    ${PROTO_SRCS}
+    ${PROTO_HDRS})
+
+set_property(TARGET testService PROPERTY CXX_STANDARD 17)
+target_link_libraries(testService ${Protobuf_LIBRARIES} bus)
 
 add_test(NAME bus COMMAND testBus)
+add_test(NAME service COMMAND testService)
 
 #target_include_directories( main PUBLIC)
 
-target_link_libraries(testBus ${Protobuf_LIBRARIES} bus)
+
