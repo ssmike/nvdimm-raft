@@ -2,7 +2,9 @@
 
 #include "fwd.h"
 #include "buffer.h"
+#include "lock.h"
 
+#include <atomic>
 #include <optional>
 #include <stdint.h>
 #include <cstddef>
@@ -67,7 +69,7 @@ public:
     void add(SocketHolder, uint64_t id, int dest);
 
     ConnData* select(uint64_t);
-    
+
     // makes unavailable
     ConnData* take_available(int dest);
 
@@ -83,7 +85,10 @@ public:
 
 private:
     class Impl;
-    std::unique_ptr<Impl> impl_;
+    bus::internal::ExclusiveWrapper<std::unique_ptr<Impl>> impl_;
+
+    std::atomic<uint64_t> id_ = 0;
+    std::atomic<uint64_t> size_ = 0;
 };
 
 }
