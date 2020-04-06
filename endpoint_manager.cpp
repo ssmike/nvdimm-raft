@@ -1,6 +1,7 @@
 #include "endpoint_manager.h"
 
 #include "error.h"
+#include "lock.h"
 
 #include <sstream>
 #include <cstring>
@@ -36,27 +37,19 @@ void set_nodelay(int socket) {
 
 class EndpointManager::Impl {
 public:
-    int resolve(sockaddr_in6* addr) {
-        if (resolve_map_.find(*addr) != resolve_map_.end()) {
-            return resolve_map_[*addr];
-        }
-        int result = resolve_map_.size();
-        resolve_map_[*addr] = result;
-        if (result >= endpoints_.size()) {
-            endpoints_.resize(result + 1);
-        }
-        endpoints_[result] = *addr;
-        return result;
-    }
-
     SocketHolder async_connect(int dest) {
-        if (dest > endpoints_.size()) {
-            throw BusError("invalid endpoint");
+        sockaddr_in6 addr;
+        {
+            auto state = state_.get();
+            if (dest > state->endpoints_.size()) {
+                throw BusError("invalid endpoint");
+            }
+            addr = state->endpoints_[dest];
         }
+
         SocketHolder sock = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         CHECK_ERRNO(sock.get() >= 0);
-        sockaddr_in6* addr = &endpoints_[dest];
-        int status = connect(sock.get(), reinterpret_cast<sockaddr*>(addr), sizeof(sockaddr_in6));
+        int status = connect(sock.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(sockaddr_in6));
         CHECK_ERRNO(status == 0 || errno == EINPROGRESS || errno == EINTR);
         set_nodelay(sock.get());
         return sock;
@@ -70,7 +63,7 @@ public:
         };
         conn.errno_ = errno;
         if (conn.sock_.get() >= 0 && addr.sin6_family == AF_INET6 && addrlen == sizeof(addr)) {
-            conn.endpoint_ = resolve(&addr);
+            conn.endpoint_ = state_.get()->resolve(&addr);
             return conn;
         } else {
             conn.sock_ = SocketHolder();
@@ -79,8 +72,24 @@ public:
     }
 
 public:
-    std::unordered_map<sockaddr_in6, int, SockaddrHash, SockaddrCompare> resolve_map_;
-    std::vector<sockaddr_in6> endpoints_;
+    struct State {
+        std::unordered_map<sockaddr_in6, int, SockaddrHash, SockaddrCompare> resolve_map_;
+        std::vector<sockaddr_in6> endpoints_;
+
+        int resolve(sockaddr_in6* addr) {
+            if (resolve_map_.find(*addr) != resolve_map_.end()) {
+                return resolve_map_[*addr];
+            }
+            int result = resolve_map_.size();
+            resolve_map_[*addr] = result;
+            if (result >= endpoints_.size()) {
+                endpoints_.resize(result + 1);
+            }
+            endpoints_[result] = *addr;
+            return result;
+        }
+    };
+    internal::ExclusiveWrapper<State> state_;
 };
 
 EndpointManager::EndpointManager()
@@ -99,14 +108,15 @@ int EndpointManager::register_endpoint(std::string addr, int port) {
         throw BusError(gai_strerror(res));
     }
     std::optional<int> result = std::nullopt;
+    auto state = impl_->state_.get();
     for (addrinfo* i = info; i != nullptr; i = i->ai_next) {
         sockaddr_in6 addr = *reinterpret_cast<sockaddr_in6*>(info->ai_addr);
         addr.sin6_port = htons(port);
         if (info->ai_family == AF_INET6) {
             if (!result) {
-                result = impl_->resolve(&addr);
+                result = state->resolve(&addr);
             }
-            impl_->resolve_map_[addr] = result.value();
+            state->resolve_map_[addr] = result.value();
         }
     }
     freeaddrinfo(info);
