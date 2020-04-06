@@ -217,7 +217,7 @@ public:
                 result.set_value(f(t));
             });
         state_->apply(std::move(f));
-        return result;
+        return result.future();
     }
 
     template<typename Func>
@@ -232,7 +232,7 @@ public:
                 }
             });
         state_->apply(std::move(f));
-        return result;
+        return result.future();
     }
 
 private:
@@ -250,6 +250,10 @@ public:
     template<typename... Args>
     void set_value(Args... args) {
         state_->set_value(std::forward<Args>(args)...);
+    }
+
+    Future<T> future() {
+        return state_;
     }
 
 private:
