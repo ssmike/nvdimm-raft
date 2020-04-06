@@ -71,7 +71,7 @@ public:
 
 public:
     template<typename... Args>
-    ExclusiveWrapper(Args... args)
+    ExclusiveWrapper(Args&&... args)
         : value_(std::forward<Args>(args)...)
     {
     }
