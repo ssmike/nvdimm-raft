@@ -3,7 +3,7 @@
 #include "bus.h"
 #include "service.pb.h"
 #include "error.h"
-#include "util.h"
+#include "future.h"
 
 
 #include <vector>
@@ -46,15 +46,15 @@ public:
     };
 
 public:
-    ProtoBus(TcpBus& bus, BufferPool& pool)
+    ProtoBus(TcpBus::Options opts, EndpointManager& manager, BufferPool& pool)
         : pool_(pool)
-        , bus_(bus)
+        , bus_(opts, pool, manager)
     {
-        bus_.set_handler([=](auto d, auto v) { this->handle(d, v); });
+        bus_.start([=](auto d, auto v) { this->handle(d, v); });
     }
 
     template<typename RequestProto, typename ResponseProto>
-    internal::Future<ResponseProto> send(RequestProto proto, int dest, uint64_t method) {
+    Future<ResponseProto> send(RequestProto proto, int dest, uint64_t method) {
         detail::Message header;
         header.set_data(proto.SerializeAsString());
         auto buffer = ScopedBuffer(pool_);
@@ -90,7 +90,7 @@ private:
 
 private:
     BufferPool& pool_;
-    TcpBus& bus_;
+    TcpBus bus_;
     std::vector<std::function<void(int, bus::detail::Message)>> handlers_;
 };
 
