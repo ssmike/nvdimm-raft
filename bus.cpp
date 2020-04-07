@@ -1,5 +1,6 @@
 #include "bus.h"
 #include "util.h"
+#include "lock.h"
 
 #include "error.h"
 
@@ -138,13 +139,14 @@ public:
     void handle_write(ConnData* data) {
         do {
             if (!data->egress_message) {
-                auto& queue = pending_messages_[data->dest];
+                auto messages = pending_messages_.get();
+                auto& queue = (*messages)[data->dest];
                 if (queue.empty()) {
                     return;
                 }
                 data->egress_message = queue.front();
                 data->egress_offset = 0;
-                pending_messages_[data->dest].pop();
+                (*messages)[data->dest].pop();
             }
         } while (try_write_message(data));
     }
@@ -223,7 +225,7 @@ public:
             } else if (errno == EINTR) {
                 continue;
             } else {
-                pending_messages_[data->dest].push(std::move(*data->egress_message));
+                (*pending_messages_.get())[data->dest].push(std::move(*data->egress_message));
                 pool_.close(data->id);
                 return false;
             }
@@ -237,7 +239,7 @@ public:
             data->egress_offset = 0;
             try_write_message(data);
         } else {
-            pending_messages_[dest].push(std::move(message));
+            (*pending_messages_.get())[dest].push(std::move(message));
         }
     }
 
@@ -262,7 +264,7 @@ public:
     ConnectPool pool_;
     const size_t fixed_pool_size_;
 
-    std::unordered_map<int, std::queue<SharedView>> pending_messages_;
+    internal::ExclusiveWrapper<std::unordered_map<int, std::queue<SharedView>>> pending_messages_;
 
     BufferPool& buffer_pool_;
     EndpointManager& endpoint_manager_;
