@@ -2,8 +2,10 @@
 
 #include "buffer.h"
 #include "endpoint_manager.h"
-#include <memory>
 #include "fwd.h"
+
+#include <functional>
+#include <memory>
 
 namespace bus {
 
@@ -19,7 +21,7 @@ public:
 public:
     TcpBus(Options, BufferPool&, EndpointManager&);
 
-    void set_handler(std::function<void(int, SharedView)>);
+    void start(std::function<void(int, SharedView)>);
 
     void send(int dest, SharedView);
 

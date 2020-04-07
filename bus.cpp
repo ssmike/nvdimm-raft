@@ -25,39 +25,43 @@ class TcpBus::Impl {
 public:
     Impl(bus::TcpBus::Options opts, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
         : fixed_pool_size_(opts.fixed_pool_size)
+        , port_(opts.port)
+        , listener_backlog_(opts.listener_backlog)
         , buffer_pool_(buffer_pool)
         , endpoint_manager_(endpoint_manager)
         , max_message_size_(opts.max_message_size)
     {
-      listensock_ = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                           IPPROTO_TCP);
-      CHECK_ERRNO(listensock_ >= 0);
+        epollfd_ = epoll_create1(EPOLL_CLOEXEC);
+        CHECK_ERRNO(epollfd_ >= 0);
+    }
 
-      {
-          int optval = 1;
-          setsockopt(listensock_, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
-      }
+    void start(std::function<void(int, SharedView)> handler) {
+        handler_ = std::move(handler);
 
-      sockaddr_in6 addr;
-      addr.sin6_family = AF_INET6;
-      addr.sin6_addr = in6addr_any;
-      addr.sin6_port = htons(opts.port);
-      CHECK_ERRNO(bind(listensock_, reinterpret_cast<struct sockaddr *>(&addr),
-                       sizeof(addr)) == 0);
+        listensock_ = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                             IPPROTO_TCP);
+        CHECK_ERRNO(listensock_ >= 0);
 
-      CHECK_ERRNO(listen(listensock_, opts.listener_backlog) == 0);
+        {
+            int optval = 1;
+            setsockopt(listensock_, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+        }
 
-      epollfd_ = epoll_create1(EPOLL_CLOEXEC);
-      CHECK_ERRNO(epollfd_ >= 0);
+        sockaddr_in6 addr;
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr = in6addr_any;
+        addr.sin6_port = htons(port_);
+        CHECK_ERRNO(bind(listensock_, reinterpret_cast<struct sockaddr *>(&addr),
+                         sizeof(addr)) == 0);
 
-      {
-          epoll_event evt;
-          evt.events = EPOLLIN;
-          evt.data.u64 = listend_id_ = pool_.make_id();
-          CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, listensock_, &evt) == 0);
+        CHECK_ERRNO(listen(listensock_, listener_backlog_) == 0);
 
-          event_buf_.emplace_back();
-      }
+        {
+            epoll_event evt;
+            evt.events = EPOLLIN;
+            evt.data.u64 = listend_id_ = pool_.make_id();
+            CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, listensock_, &evt) == 0);
+        }
     }
 
     ~Impl() {
@@ -146,27 +150,29 @@ public:
     }
 
     void loop() {
+        std::vector<epoll_event> event_buf;
         while (true) {
-            int ready = epoll_wait(epollfd_, event_buf_.data(), event_buf_.size(), -1);
+            event_buf.resize(pool_.count_connections() + 1);
+            int ready = epoll_wait(epollfd_, event_buf.data(), event_buf.size(), -1);
             if (errno == EINTR) {
                 continue;
             }
             CHECK_ERRNO(ready >= 0);
             for (size_t i = 0; i < ready; ++i) {
-                uint64_t id = event_buf_[i].data.u64;
+                uint64_t id = event_buf[i].data.u64;
                 if (id == listend_id_) {
                     accept_conns();
                 } else if (ConnData* data = pool_.select(id)) {
                     int dest = data->dest;
-                    if (event_buf_[i].events & EPOLLERR) {
+                    if (event_buf[i].events & EPOLLERR) {
                         pool_.close(id);
                         fix_pool_size(dest);
                         continue;
                     }
-                    if (event_buf_[i].events & EPOLLIN) {
+                    if (event_buf[i].events & EPOLLIN) {
                         handle_read(data);
                     }
-                    if (data && (event_buf_[i].events & EPOLLOUT) != 0) {
+                    if (data && (event_buf[i].events & EPOLLOUT) != 0) {
                         handle_write(data);
                     }
                 }
@@ -240,7 +246,6 @@ public:
         evt.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLET;
         evt.data.u64 = pool_.make_id();
         CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, fd, &evt) == 0);
-        event_buf_.resize(pool_.count_connections() + 1);
         return evt.data.u64;
     }
 
@@ -251,16 +256,18 @@ public:
     int listensock_;
     size_t listend_id_;
 
-    std::vector<epoll_event> event_buf_;
+    const int port_;
+    const size_t listener_backlog_;
+
     ConnectPool pool_;
-    size_t fixed_pool_size_;
+    const size_t fixed_pool_size_;
 
     std::unordered_map<int, std::queue<SharedView>> pending_messages_;
 
     BufferPool& buffer_pool_;
     EndpointManager& endpoint_manager_;
 
-    size_t max_message_size_;
+    const size_t max_message_size_;
 };
 
 TcpBus::TcpBus(Options opts, BufferPool& buffer_pool, EndpointManager& endpoint_manager)
@@ -268,12 +275,12 @@ TcpBus::TcpBus(Options opts, BufferPool& buffer_pool, EndpointManager& endpoint_
 {
 }
 
-void TcpBus::set_handler(std::function<void(int, SharedView)> handler) {
-    impl_->handler_ = handler;
-}
-
 void TcpBus::send(int dest, SharedView buffer) {
     impl_->send(dest, std::move(buffer));
+}
+
+void TcpBus::start(std::function<void(int, SharedView)> handler) {
+    impl_->start(std::move(handler));
 }
 
 void TcpBus::loop() {

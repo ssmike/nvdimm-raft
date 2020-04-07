@@ -21,7 +21,7 @@ int main() {
 
         size_t messages_received = 0;
 
-        first.set_handler([&](int endp, SharedView view) {
+        first.start([&](int endp, SharedView view) {
                 Operation op2;
                 op2.ParseFromArray(view.data(), view.size());
                 assert(op2.key() == "key");
