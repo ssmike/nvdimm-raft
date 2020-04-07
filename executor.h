@@ -32,6 +32,7 @@ public:
     ~DelayedExecutor() {
         shot_down_.store(true);
         ready_.notify();
+        shot_down_event_.wait();
     }
 
 private:
@@ -63,6 +64,7 @@ private:
                 }
             }
         }
+        shot_down_event_.notify();
     }
 
 private:
@@ -70,6 +72,7 @@ private:
     ExclusiveWrapper<std::multimap<std::chrono::system_clock::time_point, std::function<void()>>> actions_;
     Event ready_;
     std::atomic_bool shot_down_ = false;
+    Event shot_down_event_;
 };
 
 }
