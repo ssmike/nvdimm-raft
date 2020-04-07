@@ -22,11 +22,15 @@ public:
 
     void schedule(std::function<void()> what, std::chrono::duration<double> when) {
         auto deadline = std::chrono::time_point_cast<std::chrono::system_clock::time_point::duration>(std::chrono::system_clock::now() + when);
-        actions_.get()->insert({ deadline, std::move(what) });
+        auto actions = actions_.get();
+        actions->insert({ deadline, std::move(what) });
+        ready_.notify();
     }
 
     void schedule(std::function<void()> what, std::chrono::time_point<std::chrono::system_clock> when) {
-        actions_.get()->insert({ when, std::move(what) });
+        auto actions = actions_.get();
+        actions->insert({ when, std::move(what) });
+        ready_.notify();
     }
 
     ~DelayedExecutor() {

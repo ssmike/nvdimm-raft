@@ -1,50 +1,17 @@
 #pragma once
 
 #include "bus.h"
-#include "service.pb.h"
 #include "error.h"
 #include "future.h"
+#include "executor.h"
 
-
+#include <chrono>
 #include <vector>
 #include <functional>
 
 namespace bus {
 
 class ProtoBus {
-public:
-    template<typename ResponseProto>
-    class ResponseHandle {
-    public:
-        using ReturnType = ResponseProto;
-
-    public:
-        ResponseHandle(bus::detail::Message header, int rcp, TcpBus* bus, BufferPool* pool)
-            : header_(std::move(header))
-            , recipient_(rcp)
-            , bus_(bus)
-            , pool_(pool)
-        {
-        }
-
-        ResponseHandle(const ResponseHandle&) = delete;
-        ResponseHandle(ResponseHandle&&) = default;
-
-        void answer(ResponseProto proto) {
-            header_.set_data(proto.SerializeAsString());
-            auto buffer = ScopedBuffer(*pool_);
-            buffer.get().resize(header_.ByteSizeLong());
-            header_.SerializeToArray(buffer.get().data(), buffer.get().size());
-            bus_->send(recipient_, std::move(buffer));
-        }
-
-    private:
-        bus::detail::Message header_;
-        int recipient_ = std::numeric_limits<int>::max();
-        TcpBus* bus_ = nullptr;
-        BufferPool* pool_ = nullptr;
-    };
-
 public:
     ProtoBus(TcpBus::Options opts, EndpointManager& manager, BufferPool& pool)
         : pool_(pool)
@@ -54,44 +21,44 @@ public:
     }
 
     template<typename RequestProto, typename ResponseProto>
-    Future<ResponseProto> send(RequestProto proto, int dest, uint64_t method) {
-        detail::Message header;
-        header.set_data(proto.SerializeAsString());
-        auto buffer = ScopedBuffer(pool_);
-        buffer.get().resize(header.ByteSizeLong());
-        header.SerializeToArray(buffer.get().data(), buffer.get().size());
-        bus_.send(dest, std::move(buffer));
+    Future<ErrorT<ResponseProto>> send(RequestProto proto, int dest, uint64_t method, std::chrono::duration<double> timeout) {
+        return send_raw(proto.SerializeAsString(), dest, method, timeout).apply(
+            [=](ErrorT<std::string>& resp) {
+                if (resp) {
+                    return ErrorT<ResponseProto>::error(resp.what());
+                } else {
+                    ResponseProto proto;
+                    proto.ParseFromString(resp.unwrap());
+                    return proto;
+                }
+            });
     }
 
 protected:
     template<typename RequestProto, typename ResponseProto>
-    void register_handler(uint32_t method, std::function<void(RequestProto, ResponseHandle<ResponseProto>)> f) {
-        handlers_.resize(std::max<uint32_t>(handlers_.size(), method + 1));
-        handlers_.push_back(
-            [f=std::move(f), this] (int dest, bus::detail::Message header) {
+    void register_handler(uint32_t method, std::function<Future<ResponseProto>(RequestProto)> handler) {
+        register_raw_handler(method, [handler=std::move(handler)] (std::string str) {
                 RequestProto proto;
-                proto.ParseFromString(header.data());
-
-                header.clear_data();
-                f(proto, ResponseHandle<ResponseProto>(std::move(header), dest, &bus_, &pool_));
+                proto.ParseFromString(str);
+                return handler(std::move(proto)).apply([=] (ResponseProto& proto) { return proto.SerializeAsString(); });
             });
     }
 
 private:
-    void handle(int dest, SharedView view) {
-        bus::detail::Message header;
-        header.ParseFromArray(view.data(), view.size());
-        if (handlers_.size() <= header.method() || !handlers_[header.method()]) {
-            throw BusError("invalid handler number");
-        } else {
-            handlers_[header.method()](dest, std::move(header));
-        }
-    }
+    Future<ErrorT<std::string>> send_raw(std::string serialized, int dest, uint64_t method, std::chrono::duration<double> timeout);
+
+    void register_raw_handler(uint32_t method, std::function<Future<std::string>(std::string)> handler);
+
+    void handle(int dest, SharedView view);
 
 private:
     BufferPool& pool_;
     TcpBus bus_;
-    std::vector<std::function<void(int, bus::detail::Message)>> handlers_;
+    std::vector<std::function<void(int, uint32_t, std::string)>> handlers_;
+    internal::DelayedExecutor exc_;
+
+    internal::ExclusiveWrapper<std::unordered_map<uint64_t, Promise<ErrorT<std::string>>>> sent_requests_;
+    std::atomic<uint64_t> seq_id_;
 };
 
 }

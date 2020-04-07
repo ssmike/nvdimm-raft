@@ -61,17 +61,25 @@ namespace bus {
     class FutureState {
     public:
         template<typename... Args>
-        void set_value(Args... args) {
+        void set_value(bool check_double_set, Args... args) {
             std::vector<std::function<void(T&)>> to_call;
             if (!evt_.set()) {
                 std::unique_lock lock(mutex_);
                 if (value_) {
-                    throw std::logic_error("double FutureState::set_value");
+                    if (check_double_set) {
+                        throw std::logic_error("double FutureState::set_value");
+                    } else {
+                        return;
+                    }
                 }
                 value_.emplace(std::forward<Args>(args)...);
                 to_call = std::move(callbacks_);
             } else {
-                throw std::logic_error("double FutureState::set_value");
+                if (check_double_set) {
+                    throw std::logic_error("double FutureState::set_value");
+                } else {
+                    return;
+                }
             }
             evt_.notify();
             for (auto& cb : to_call) {
@@ -95,6 +103,10 @@ namespace bus {
                     callbacks_.push_back(std::move(f));
                 }
             }
+        }
+
+        bool has_value() {
+            return evt_.set() && value_.has_value();
         }
 
         T& get() {
@@ -128,9 +140,8 @@ public:
         value_.emplace(std::forward<Args>(args)...);
     }
 
-    template<typename... Args>
-    static ErrorT<T> error(Args&&... args) {
-        return ErrorT(ErrorT<T>::FailureTag(), std::forward<Args>(args)...);
+    static ErrorT<T> error(std::string msg) {
+        return ErrorT(ErrorT<T>::FailureTag(), std::move(msg));
     }
 
     operator bool () const {
@@ -177,7 +188,7 @@ public:
     Future<std::invoke_result_t<Func, T&>> map(Func f) {
         Promise<Future<std::invoke_result_t<Func, T&>>> result;
         state_->apply([f=std::move(f), result] (T& t) {
-                result.set_value(f(t));
+                result.set_value(true, f(t));
             });
         state_->apply(std::move(f));
         return result.future();
@@ -189,9 +200,9 @@ public:
         Promise<Future<std::invoke_result_t<Func, T&>>> result;
         state_->apply([f=std::move(f), result] (T& t) {
                 try {
-                    result.set_value(f(t));
+                    result.set_value(true, f(t));
                 } catch(const std::exception& e) {
-                    result.set_value(ErrorT<return_t>::error(e.what()));
+                    result.set_value(true, ErrorT<return_t>::error(e.what()));
                 }
             });
         state_->apply(std::move(f));
@@ -211,8 +222,17 @@ public:
     Promise(Promise<T>&&) = default;
 
     template<typename... Args>
-    void set_value(Args... args) {
-        state_->set_value(std::forward<Args>(args)...);
+    void set_value(Args&&... args) {
+        state_->set_value(/* check double-set */ false, std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    void try_set_value(Args&&... args) {
+        state_->set_value(/* check double-set */ true, std::forward<Args>(args)...);
+    }
+
+    bool has_value() {
+        return state_->has_value();
     }
 
     Future<T> future() {

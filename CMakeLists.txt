@@ -12,6 +12,7 @@ protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS messages.proto service.proto)
 
 add_library(bus
     bus.h bus.cpp
+    proto_bus.h proto_bus.cpp
     connect_pool.h connect_pool.cpp
     endpoint_manager.h endpoint_manager.cpp
     error.h error.cpp
@@ -26,7 +27,7 @@ add_executable(testBus testBus.cpp
 set_property(TARGET testBus PROPERTY CXX_STANDARD 17)
 target_link_libraries(testBus ${Protobuf_LIBRARIES} bus)
 
-add_executable(testService testBus.cpp
+add_executable(testService testService.cpp
     ${PROTO_SRCS}
     ${PROTO_HDRS})
 
