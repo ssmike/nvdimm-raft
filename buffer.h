@@ -2,6 +2,8 @@
 
 #include "fwd.h"
 
+#include "lock.h"
+
 #include <limits>
 #include <memory>
 #include <stack>
@@ -21,31 +23,33 @@ public:
     {
     }
 
-    size_t take() {
-        if (free_.empty()) {
-            free_.push(buffers_.size());
-            buffers_.emplace_back();
-            buffers_.back().reserve(start_size_);
+    std::tuple<size_t, GenericBuffer*> take() {
+        auto state = state_.get();
+        if (state->free_.empty()) {
+            state->buffers_.emplace_back(new GenericBuffer());
+            state->buffers_.back()->reserve(start_size_);
+            return { state->buffers_.size() - 1, state->buffers_.back().get() };
+        } else {
+            size_t result = state->free_.top();
+            state->free_.pop();
+            return { result, state->buffers_[result].get() };
         }
-        size_t result = free_.top();
-        free_.pop();
-        return result;
     }
 
     void put(size_t num) {
         if (num != kInvalidBuffer) {
-            free_.push(num);
+            state_.get()->free_.push(num);
         }
     }
 
-    GenericBuffer& get(size_t num) {
-        return buffers_[num];
-    }
-
 private:
-    std::vector<bus::GenericBuffer> buffers_;
-    std::stack<size_t> free_;
-    size_t start_size_;
+    struct State {
+        std::vector<std::unique_ptr<bus::GenericBuffer>> buffers_;
+        std::stack<size_t> free_;
+    };
+
+    internal::ExclusiveWrapper<State> state_;
+    const size_t start_size_;
 };
 
 class ScopedBuffer {
@@ -53,9 +57,9 @@ public:
     ScopedBuffer() = default;
 
     ScopedBuffer(BufferPool& pool)
-        : buf_(pool.take())
-        , pool_(&pool)
+        : pool_(&pool)
     {
+        std::tie(num_, buf_) = pool_->take();
     }
 
     ScopedBuffer(const ScopedBuffer&) = delete;
@@ -65,26 +69,28 @@ public:
     {
         pool_ = other.pool_;
         buf_ = other.buf_;
-        other.buf_ = BufferPool::kInvalidBuffer;
+        other.num_ = BufferPool::kInvalidBuffer;
     }
 
     void operator = (ScopedBuffer&& other) {
         std::swap(pool_, other.pool_);
         std::swap(buf_, other.buf_);
+        std::swap(num_, other.num_);
     }
 
     GenericBuffer& get() {
-        return pool_->get(buf_);
+        return *buf_;
     }
 
     ~ScopedBuffer() {
         if (pool_) {
-            pool_->put(buf_);
+            pool_->put(num_);
         }
     }
 
 private:
-    size_t buf_ = BufferPool::kInvalidBuffer;
+    size_t num_ = BufferPool::kInvalidBuffer;
+    GenericBuffer* buf_ = nullptr;
     BufferPool* pool_ = nullptr;
 };
 
