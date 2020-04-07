@@ -6,6 +6,7 @@
 #include <optional>
 #include <vector>
 #include <functional>
+#include <chrono>
 
 namespace bus {
     namespace internal {
@@ -39,6 +40,13 @@ namespace bus {
             if (!set()) {
               std::unique_lock<std::mutex> lock(mutex_);
               cv_.wait(lock, [&] { return event_set_.load(); });
+            }
+        }
+
+        void wait_until(std::chrono::system_clock::time_point pt) {
+            if (!set()) {
+              std::unique_lock<std::mutex> lock(mutex_);
+              cv_.wait_until(lock, pt, [&] { return event_set_.load(); });
             }
         }
 
