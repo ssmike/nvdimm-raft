@@ -47,9 +47,13 @@ private:
 };
 
 struct ConnData {
-    // doesn't include header
-    std::optional<SharedView> egress_message;
-    uint64_t egress_offset = 0;
+    struct EgressData {
+        // doesn't include header
+        std::optional<SharedView> message;
+        uint64_t offset = 0;
+    };
+
+    internal::ExclusiveWrapper<EgressData> egress_data;
 
     ScopedBuffer ingress_buf;
     size_t ingress_offset = 0;

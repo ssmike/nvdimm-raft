@@ -137,18 +137,22 @@ public:
     }
 
     void handle_write(ConnData* data) {
-        do {
-            if (!data->egress_message) {
+        while (1) {
+            auto egress_data = data->egress_data.get();
+            if (!egress_data->message) {
                 auto messages = pending_messages_.get();
                 auto& queue = (*messages)[data->dest];
                 if (queue.empty()) {
                     return;
                 }
-                data->egress_message = queue.front();
-                data->egress_offset = 0;
+                egress_data->message = queue.front();
+                egress_data->offset = 0;
                 (*messages)[data->dest].pop();
             }
-        } while (try_write_message(data));
+            if (!try_write_message(data, egress_data)) {
+                return;
+            }
+        }
     }
 
     void loop() {
@@ -182,24 +186,24 @@ public:
         }
     }
 
-    bool try_write_message(ConnData* data) {
-        if (!data->egress_message) {
+    bool try_write_message(ConnData* data, internal::ExclusiveGuard<ConnData::EgressData>& egress_data) {
+        if (!egress_data->message) {
             return true;
         }
 
         int fd = data->socket.get();
 
         char header[internal::header_len];
-        internal::write_header(data->egress_message->size(), header);
+        internal::write_header(egress_data->message->size(), header);
 
         while (true) {
             iovec iov_holder[2];
             iov_holder[0] = {.iov_base = header, .iov_len = internal::header_len};
-            iov_holder[1] = {.iov_base = (void*)data->egress_message->data(), .iov_len = data->egress_message->size()};
+            iov_holder[1] = {.iov_base = (void*)egress_data->message->data(), .iov_len = egress_data->message->size()};
 
             iovec* iov = iov_holder;
             int iovcnt = 2;
-            size_t offset = data->egress_offset;
+            size_t offset = egress_data->offset;
 
             while (iovcnt > 0 && offset > iov[0].iov_len) {
                 offset -= iov[0].iov_len;
@@ -214,9 +218,9 @@ public:
             }
             ssize_t res = writev(fd, iov, iovcnt);
             if (res >= 0) {
-                data->egress_offset += res;
-                if (data->egress_offset == internal::header_len + data->egress_message->size()) {
-                    data->egress_message.reset();
+                egress_data->offset += res;
+                if (egress_data->offset == internal::header_len + egress_data->message->size()) {
+                    egress_data->message.reset();
                     pool_.set_available(data->id);
                 }
                 return true;
@@ -225,7 +229,7 @@ public:
             } else if (errno == EINTR) {
                 continue;
             } else {
-                (*pending_messages_.get())[data->dest].push(std::move(*data->egress_message));
+                (*pending_messages_.get())[data->dest].push(std::move(*egress_data->message));
                 pool_.close(data->id);
                 return false;
             }
@@ -235,9 +239,10 @@ public:
     void send(int dest, SharedView message) {
         fix_pool_size(dest);
         if (auto data = pool_.take_available(dest)) {
-            data->egress_message = std::move(message);
-            data->egress_offset = 0;
-            try_write_message(data);
+            auto egress_data = data->egress_data.get();
+            egress_data->message = std::move(message);
+            egress_data->offset = 0;
+            try_write_message(data, egress_data);
         } else {
             (*pending_messages_.get())[dest].push(std::move(message));
         }
