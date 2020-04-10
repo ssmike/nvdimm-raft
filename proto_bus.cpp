@@ -14,7 +14,7 @@ namespace bus {
         bus_.send(dest, std::move(buffer));
         Promise<ErrorT<std::string>> promise;
         sent_requests_.get()->insert({ seq_id, promise });
-        exc_.schedule([=] () mutable { 
+        exc_.schedule([=] () mutable {
                 auto requests = sent_requests_.get();
                 auto it = requests->find(seq_id);
                 if (it == requests->end()) {
@@ -55,6 +55,7 @@ namespace bus {
             auto reqs = sent_requests_.get();
             auto it = reqs->find(header.seq_id());
             if (it != reqs->end()) {
+                it->second.set_value(ErrorT<std::string>::value(std::move(*header.mutable_data())));
             }
         }
     }

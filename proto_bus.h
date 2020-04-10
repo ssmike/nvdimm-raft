@@ -16,8 +16,10 @@ public:
     ProtoBus(TcpBus::Options opts, EndpointManager& manager, BufferPool& pool)
         : pool_(pool)
         , bus_(opts, pool, manager)
+        , loop_([&] { bus_.loop(); }, std::chrono::seconds::zero())
     {
         bus_.start([=](auto d, auto v) { this->handle(d, v); });
+        loop_.start();
     }
 
     template<typename RequestProto, typename ResponseProto>
@@ -59,6 +61,8 @@ private:
 
     internal::ExclusiveWrapper<std::unordered_map<uint64_t, Promise<ErrorT<std::string>>>> sent_requests_;
     std::atomic<uint64_t> seq_id_;
+
+    internal::PeriodicExecutor loop_;
 };
 
 }

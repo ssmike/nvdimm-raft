@@ -19,7 +19,7 @@ namespace bus {
             notify();
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                event_set_.store(true);
+                event_set_.store(false);
             }
         }
 
@@ -27,8 +27,8 @@ namespace bus {
             bool val = true;
             event_set_.exchange(val);
             if (!val) {
-              std::unique_lock<std::mutex> lock(mutex_);
-              cv_.notify_all();
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.notify_all();
             }
         }
 
@@ -38,16 +38,17 @@ namespace bus {
 
         void wait() {
             if (!set()) {
-              std::unique_lock<std::mutex> lock(mutex_);
-              cv_.wait(lock, [&] { return event_set_.load(); });
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [&] { return event_set_.load(); });
             }
         }
 
-        void wait_until(std::chrono::system_clock::time_point pt) {
+        bool wait_until(std::chrono::system_clock::time_point pt) {
             if (!set()) {
-              std::unique_lock<std::mutex> lock(mutex_);
-              cv_.wait_until(lock, pt, [&] { return event_set_.load(); });
+                std::unique_lock<std::mutex> lock(mutex_);
+                return cv_.wait_until(lock, pt, [&] { return set(); });
             }
+            return true;
         }
 
     private:

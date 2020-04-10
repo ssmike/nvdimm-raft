@@ -13,21 +13,22 @@ namespace bus::internal {
 class DelayedExecutor {
 public:
     DelayedExecutor()
-        : thread_()
+        : thread_(std::bind(&DelayedExecutor::execute, this))
     {
     }
 
     DelayedExecutor(const DelayedExecutor&) = delete;
     DelayedExecutor(DelayedExecutor&&) = delete;
 
-    void schedule(std::function<void()> what, std::chrono::duration<double> when) {
+    template<typename Duration>
+    void schedule(std::function<void()> what, Duration when) {
         auto deadline = std::chrono::time_point_cast<std::chrono::system_clock::time_point::duration>(std::chrono::system_clock::now() + when);
         auto actions = actions_.get();
         actions->insert({ deadline, std::move(what) });
         ready_.notify();
     }
 
-    void schedule(std::function<void()> what, std::chrono::time_point<std::chrono::system_clock> when) {
+    void schedule_point(std::function<void()> what, std::chrono::time_point<std::chrono::system_clock> when) {
         auto actions = actions_.get();
         actions->insert({ when, std::move(what) });
         ready_.notify();
@@ -42,27 +43,28 @@ public:
 private:
     void execute() {
         while (!shot_down_.load()) {
-            std::function<void()> to_execute;
             std::optional<std::chrono::system_clock::time_point> wait_until;
-            {
-                auto actions = actions_.get();
-                ready_.reset();
-                to_execute = std::move(actions->begin()->second);
-                actions->erase(actions->begin());
 
-                if (!actions->empty()) {
-                    wait_until = actions->begin()->first;
-                }
-            }
-            if (to_execute) {
-                try {
-                    to_execute();
-                } catch (...) {
-                }
+            if (auto actions = actions_.get(); !actions->empty()) {
+                ready_.reset();
+                wait_until = actions->begin()->first;
             }
             if (!shot_down_.load()) {
+                auto time = *wait_until - std::chrono::system_clock::now();
                 if (wait_until) {
-                    ready_.wait_until(*wait_until);
+                    if (!ready_.wait_until(*wait_until)) {
+                        std::function<void()> to_execute;
+                        if (auto actions = actions_.get(); !actions->empty()) {
+                            to_execute = std::move(actions->begin()->second);
+                            actions->erase(actions->begin());
+                        }
+                        if (to_execute) {
+                            try {
+                                to_execute();
+                            } catch (...) {
+                            }
+                        }
+                    }
                 } else {
                     ready_.wait();
                 }
@@ -77,6 +79,30 @@ private:
     Event ready_;
     std::atomic_bool shot_down_ = false;
     Event shot_down_event_;
+};
+
+class PeriodicExecutor : DelayedExecutor {
+public:
+    template<typename Duration>
+    PeriodicExecutor(std::function<void()> f, Duration period)
+        : f_(std::move(f))
+        , period_(std::chrono::duration_cast<decltype(period_)>(period))
+    {
+    }
+
+    void start() {
+        schedule(std::bind(&PeriodicExecutor::execute, this), std::chrono::seconds::zero());
+    }
+
+private:
+    void execute() {
+        schedule(std::bind(&PeriodicExecutor::execute, this), period_);
+        f_();
+    }
+
+private:
+    std::function<void()> f_;
+    std::chrono::system_clock::duration period_;
 };
 
 }
