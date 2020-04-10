@@ -50,7 +50,6 @@ private:
                 wait_until = actions->begin()->first;
             }
             if (!shot_down_.load()) {
-                auto time = *wait_until - std::chrono::system_clock::now();
                 if (wait_until) {
                     if (!ready_.wait_until(*wait_until)) {
                         std::function<void()> to_execute;
@@ -59,10 +58,7 @@ private:
                             actions->erase(actions->begin());
                         }
                         if (to_execute) {
-                            try {
-                                to_execute();
-                            } catch (...) {
-                            }
+                            to_execute();
                         }
                     }
                 } else {
@@ -74,11 +70,11 @@ private:
     }
 
 private:
-    std::thread thread_;
     ExclusiveWrapper<std::multimap<std::chrono::system_clock::time_point, std::function<void()>>> actions_;
     Event ready_;
     std::atomic_bool shot_down_ = false;
     Event shot_down_event_;
+    std::thread thread_;
 };
 
 class PeriodicExecutor : DelayedExecutor {
