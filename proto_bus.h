@@ -22,14 +22,14 @@ public:
 
     template<typename RequestProto, typename ResponseProto>
     Future<ErrorT<ResponseProto>> send(RequestProto proto, int dest, uint64_t method, std::chrono::duration<double> timeout) {
-        return send_raw(proto.SerializeAsString(), dest, method, timeout).apply(
-            [=](ErrorT<std::string>& resp) {
+        return send_raw(proto.SerializeAsString(), dest, method, timeout).map(
+            [=](ErrorT<std::string>& resp) -> ErrorT<ResponseProto> {
                 if (resp) {
                     return ErrorT<ResponseProto>::error(resp.what());
                 } else {
                     ResponseProto proto;
                     proto.ParseFromString(resp.unwrap());
-                    return proto;
+                    return ErrorT<ResponseProto>::value(std::move(proto));
                 }
             });
     }
@@ -40,7 +40,7 @@ protected:
         register_raw_handler(method, [handler=std::move(handler)] (std::string str) {
                 RequestProto proto;
                 proto.ParseFromString(str);
-                return handler(std::move(proto)).apply([=] (ResponseProto& proto) { return proto.SerializeAsString(); });
+                return handler(std::move(proto)).map([=] (ResponseProto& proto) { return proto.SerializeAsString(); });
             });
     }
 

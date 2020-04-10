@@ -61,7 +61,7 @@ namespace bus {
     class FutureState {
     public:
         template<typename... Args>
-        void set_value(bool check_double_set, Args... args) {
+        void set_value(bool check_double_set, Args&&... args) {
             std::vector<std::function<void(T&)>> to_call;
             if (!evt_.set()) {
                 std::unique_lock lock(mutex_);
@@ -135,9 +135,20 @@ private:
     }
 
 public:
+    ErrorT() = default;
+    ErrorT(const ErrorT<T>&) = default;
+    ErrorT(ErrorT<T>&&) = default;
+
     template<typename... Args>
-    ErrorT(Args&&... args) {
+    void emplace(Args&&... args) {
         value_.emplace(std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    static ErrorT<T> value(Args&&... args) {
+        ErrorT<T> result;
+        result.emplace(std::forward<Args>(args)...);
+        return result;
     }
 
     static ErrorT<T> error(std::string msg) {
@@ -145,7 +156,7 @@ public:
     }
 
     operator bool () const {
-        return value_;
+        return value_.has_value();
     }
 
     const char* what() {
@@ -186,32 +197,37 @@ public:
 
     template<typename Func>
     Future<std::invoke_result_t<Func, T&>> map(Func f) {
-        Promise<Future<std::invoke_result_t<Func, T&>>> result;
-        state_->apply([f=std::move(f), result] (T& t) {
-                result.set_value(true, f(t));
+        Promise<std::invoke_result_t<Func, T&>> result;
+        state_->apply([f=std::move(f), result] (T& t) mutable {
+                result.set_value_once(f(t));
             });
-        state_->apply(std::move(f));
         return result.future();
     }
 
     template<typename Func>
     Future<ErrorT<std::invoke_result_t<Func, T&>>> apply(Func f) {
         using return_t = std::invoke_result_t<Func, T&>;
-        Promise<Future<std::invoke_result_t<Func, T&>>> result;
-        state_->apply([f=std::move(f), result] (T& t) {
+        Promise<ErrorT<std::invoke_result_t<Func, T&>>> result;
+        state_->apply([f=std::move(f), result] (T& t) mutable {
                 try {
-                    result.set_value(true, f(t));
+                    result.set_value_once(f(t));
                 } catch(const std::exception& e) {
-                    result.set_value(true, ErrorT<return_t>::error(e.what()));
+                    result.set_value_once(ErrorT<return_t>::error(e.what()));
                 }
             });
-        state_->apply(std::move(f));
         return result.future();
     }
 
 private:
     std::shared_ptr<internal::FutureState<T>> state_;
 };
+
+template<typename T>
+Future<T> make_future(T&& t) {
+    Promise<T> res;
+    res.set_value_once(std::forward<T>(t));
+    return res.future();
+}
 
 template<typename T>
 class Promise {
@@ -227,7 +243,7 @@ public:
     }
 
     template<typename... Args>
-    void try_set_value(Args&&... args) {
+    void set_value_once(Args&&... args) {
         state_->set_value(/* check double-set */ true, std::forward<Args>(args)...);
     }
 
