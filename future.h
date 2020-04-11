@@ -157,7 +157,7 @@ public:
     }
 
     T& unwrap() {
-        if (*this) {
+        if (!*this) {
             throw std::runtime_error(message_);
         } else {
             return *value_;

@@ -31,7 +31,7 @@ public:
             .subscribe([=](ErrorT<Operation>& op) {
                     assert(op);
                     assert(op.unwrap().key() == "key - mirrored");
-                    assert(op.unwrap().data() == "data");
+                    assert(op.unwrap().data() == "value");
                     std::cerr << "OK" << std::endl;
                     event.notify();
                 });
@@ -41,14 +41,12 @@ private:
 };
 
 int main() {
-    internal::PeriodicExecutor exc_([] { std::cerr << "periodic action" << std::endl; }, std::chrono::seconds(1));
-    exc_.start();
-    //BufferPool bufferPool{4098};
-    //EndpointManager manager;
+    BufferPool bufferPool{4098};
+    EndpointManager manager;
 
-    //SimpleService second(manager, bufferPool, 4002, false);
-    //SimpleService first(manager, bufferPool, 4003, true);
-    //int receiver = manager.register_endpoint("::1", 4003);
-    //second.execute(receiver);
+    SimpleService second(manager, bufferPool, 4002, false);
+    SimpleService first(manager, bufferPool, 4003, true);
+    int receiver = manager.register_endpoint("::1", 4003);
+    second.execute(receiver);
     event.wait();
 }

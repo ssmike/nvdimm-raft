@@ -26,7 +26,7 @@ public:
     Future<ErrorT<ResponseProto>> send(RequestProto proto, int dest, uint64_t method, std::chrono::duration<double> timeout) {
         return send_raw(proto.SerializeAsString(), dest, method, timeout).map(
             [=](ErrorT<std::string>& resp) -> ErrorT<ResponseProto> {
-                if (resp) {
+                if (!resp) {
                     return ErrorT<ResponseProto>::error(resp.what());
                 } else {
                     ResponseProto proto;
@@ -60,7 +60,7 @@ private:
     internal::DelayedExecutor exc_;
 
     internal::ExclusiveWrapper<std::unordered_map<uint64_t, Promise<ErrorT<std::string>>>> sent_requests_;
-    std::atomic<uint64_t> seq_id_;
+    std::atomic<uint64_t> seq_id_ = 0;
 
     internal::PeriodicExecutor loop_;
 };
