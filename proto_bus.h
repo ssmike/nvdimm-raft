@@ -13,9 +13,9 @@ namespace bus {
 
 class ProtoBus {
 public:
-    ProtoBus(TcpBus::Options opts, EndpointManager& manager, BufferPool& pool)
-        : pool_(pool)
-        , bus_(opts, pool, manager)
+    ProtoBus(TcpBus::Options opts, EndpointManager& manager)
+        : pool_{ opts.max_message_size }
+        , bus_(opts, pool_, manager)
         , loop_([&] { bus_.loop(); }, std::chrono::seconds::zero())
     {
         bus_.start([=](auto d, auto v) { this->handle(d, v); });
@@ -54,7 +54,7 @@ private:
     void handle(int dest, SharedView view);
 
 private:
-    BufferPool& pool_;
+    BufferPool pool_;
     TcpBus bus_;
     std::vector<std::function<void(int, uint32_t, std::string)>> handlers_;
     internal::DelayedExecutor exc_;

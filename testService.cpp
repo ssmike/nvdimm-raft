@@ -11,8 +11,8 @@ internal::Event event;
 
 class SimpleService: ProtoBus {
 public:
-    SimpleService(EndpointManager& manager, BufferPool& pool, int port, bool receiver)
-        : ProtoBus(TcpBus::Options{.port = port, .fixed_pool_size = 2}, manager, pool)
+    SimpleService(EndpointManager& manager, int port, bool receiver)
+        : ProtoBus(TcpBus::Options{.port = port, .fixed_pool_size = 2}, manager)
     {
         if (receiver) {
             register_handler<Operation, Operation>(1, [&](Operation op) -> Future<Operation> {
@@ -41,11 +41,10 @@ private:
 };
 
 int main() {
-    BufferPool bufferPool{4098};
     EndpointManager manager;
 
-    SimpleService second(manager, bufferPool, 4002, false);
-    SimpleService first(manager, bufferPool, 4003, true);
+    SimpleService second(manager, 4002, false);
+    SimpleService first(manager, 4003, true);
     int receiver = manager.register_endpoint("::1", 4003);
     second.execute(receiver);
     event.wait();
