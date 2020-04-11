@@ -45,7 +45,6 @@ namespace bus {
     void ProtoBus::handle(int dest, SharedView view) {
         bus::detail::Message header;
         header.ParseFromArray(view.data(), view.size());
-        std::cerr << header.seq_id() << " seq id " << std::endl;
         if (header.type() == detail::Message::REQUEST) {
             if (handlers_.size() <= header.method() || !handlers_[header.method()]) {
                 throw BusError("invalid handler number");
