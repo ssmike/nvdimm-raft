@@ -3,6 +3,7 @@
 #include "fwd.h"
 #include "buffer.h"
 #include "lock.h"
+#include "util.h"
 
 #include <atomic>
 #include <optional>
@@ -55,6 +56,7 @@ struct ConnData {
 
     internal::ExclusiveWrapper<EgressData> egress_data;
 
+    char ingress_header[internal::header_len];
     ScopedBuffer ingress_buf;
     size_t ingress_offset = 0;
 

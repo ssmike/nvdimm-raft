@@ -56,10 +56,11 @@ class ScopedBuffer {
 public:
     ScopedBuffer() = default;
 
-    ScopedBuffer(BufferPool& pool)
+    ScopedBuffer(BufferPool& pool, size_t size)
         : pool_(&pool)
     {
         std::tie(num_, buf_) = pool_->take();
+        buf_->resize(size);
     }
 
     ScopedBuffer(const ScopedBuffer&) = delete;

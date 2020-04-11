@@ -9,8 +9,7 @@ namespace bus {
         header.set_type(detail::Message::REQUEST);
         header.set_data(std::move(serialized));
         header.set_method(method);
-        auto buffer = ScopedBuffer(pool_);
-        buffer.get().resize(header.ByteSizeLong());
+        auto buffer = ScopedBuffer(pool_, header.ByteSizeLong());
         header.SerializeToArray(buffer.get().data(), buffer.get().size());
         bus_.send(dest, std::move(buffer));
         Promise<ErrorT<std::string>> promise;
@@ -34,8 +33,7 @@ namespace bus {
                     header.set_type(detail::Message::RESPONSE);
                     header.set_data(str);
                     header.set_seq_id(seq_id);
-                    auto buffer = ScopedBuffer(pool_);
-                    buffer.get().resize(header.ByteSizeLong());
+                    auto buffer = ScopedBuffer(pool_, header.ByteSizeLong());
                     header.SerializeToArray(buffer.get().data(), buffer.get().size());
                     bus_.send(dest, std::move(buffer));
                 });
