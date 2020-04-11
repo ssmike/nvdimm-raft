@@ -40,8 +40,8 @@ int main() {
         op.set_data("data");
         op.set_key("key");
 
-        ScopedBuffer buffer{bufferPool, op.ByteSizeLong()};
-        op.SerializeToArray(buffer.get().data(), buffer.get().size());
+        SharedView buffer{bufferPool, op.ByteSizeLong()};
+        op.SerializeToArray(buffer.data(), buffer.size());
 
         second.send(manager.register_endpoint("::1", 4001), std::move(buffer));
     }

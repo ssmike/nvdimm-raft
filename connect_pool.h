@@ -57,7 +57,7 @@ struct ConnData {
     internal::ExclusiveWrapper<EgressData> egress_data;
 
     char ingress_header[internal::header_len];
-    ScopedBuffer ingress_buf;
+    SharedView ingress_buf;
     size_t ingress_offset = 0;
 
     SocketHolder socket;

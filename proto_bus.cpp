@@ -9,8 +9,8 @@ namespace bus {
         header.set_type(detail::Message::REQUEST);
         header.set_data(std::move(serialized));
         header.set_method(method);
-        auto buffer = ScopedBuffer(pool_, header.ByteSizeLong());
-        header.SerializeToArray(buffer.get().data(), buffer.get().size());
+        auto buffer = SharedView(pool_, header.ByteSizeLong());
+        header.SerializeToArray(buffer.data(), buffer.size());
         bus_.send(dest, std::move(buffer));
         Promise<ErrorT<std::string>> promise;
         sent_requests_.get()->insert({ seq_id, promise });
@@ -33,8 +33,8 @@ namespace bus {
                     header.set_type(detail::Message::RESPONSE);
                     header.set_data(str);
                     header.set_seq_id(seq_id);
-                    auto buffer = ScopedBuffer(pool_, header.ByteSizeLong());
-                    header.SerializeToArray(buffer.get().data(), buffer.get().size());
+                    auto buffer = SharedView(pool_, header.ByteSizeLong());
+                    header.SerializeToArray((void*)buffer.data(), buffer.size());
                     bus_.send(dest, std::move(buffer));
                 });
             };

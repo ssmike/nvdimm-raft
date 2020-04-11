@@ -116,10 +116,10 @@ public:
                 has_header = true;
                 size_t message_size = internal::read_header(data->ingress_header);
                 if (!data->ingress_buf.initialized()) {
-                    data->ingress_buf = ScopedBuffer(buffer_pool_, message_size);
+                    data->ingress_buf = SharedView(buffer_pool_, message_size);
                 }
                 expected = message_size + internal::header_len - data->ingress_offset;
-                data_ptr = data->ingress_buf.get().data() + (data->ingress_offset - internal::header_len);
+                data_ptr = data->ingress_buf.data() + (data->ingress_offset - internal::header_len);
             }
             if (expected > max_message_size_) {
                 throw BusError("too big message");
@@ -129,7 +129,7 @@ public:
                 data->ingress_offset += res;
                 if (has_header && res == expected) {
                     handler_(data->dest, SharedView(std::move(data->ingress_buf)));
-                    data->ingress_buf = ScopedBuffer();
+                    data->ingress_buf = SharedView();
                     data->ingress_offset = 0;
                     continue;
                 }

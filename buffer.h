@@ -4,6 +4,7 @@
 
 #include "lock.h"
 
+#include <atomic>
 #include <limits>
 #include <memory>
 #include <stack>
@@ -18,125 +19,192 @@ public:
     static constexpr size_t kInvalidBuffer = std::numeric_limits<size_t>::max();
 
 public:
-    BufferPool(size_t start_size)
-        : start_size_(start_size)
+    struct Buffer {
+        std::vector<char> data;
+        std::atomic<uint64_t> offset = 0;
+        std::atomic<int64_t> usage_counter = 0;
+
+        size_t number;
+    };
+
+    struct DataPtr {
+        Buffer* buffer = nullptr;
+        uint64_t offset = 0;
+
+        operator bool () {
+            return buffer;
+        }
+    };
+
+public:
+    BufferPool(size_t size)
+        : size_(size)
     {
     }
 
-    std::tuple<size_t, GenericBuffer*> take() {
-        auto state = state_.get();
-        if (state->free_.empty()) {
-            state->buffers_.emplace_back(new GenericBuffer());
-            state->buffers_.back()->reserve(start_size_);
-            return { state->buffers_.size() - 1, state->buffers_.back().get() };
+    DataPtr take(size_t size) {
+        if (auto result = try_fetch(size, head_.load())) {
+            return result;
         } else {
-            size_t result = state->free_.top();
-            state->free_.pop();
-            return { result, state->buffers_[result].get() };
+            auto state = state_.get();
+            Buffer* new_buffer;
+            if (state->free_.empty()) {
+                auto buffer = std::make_unique<Buffer>();
+                buffer->data.reserve(size_);
+                buffer->data.resize(size_);
+                buffer->number = state->buffers_.size();
+                new_buffer = buffer.get();
+
+                state->buffers_.push_back(std::move(buffer));
+            } else {
+                new_buffer = state->buffers_[state->free_.top()].get();
+                state->free_.pop();
+            }
+            new_buffer->offset.store(0);
+
+            result = try_fetch(size, new_buffer);
+            head_.store(state->buffers_.back().get());
+
+            if (!result) {
+                throw std::runtime_error("bad buffer alloc");
+            } else {
+                return result;
+            }
         }
     }
 
-    void put(size_t num) {
-        if (num != kInvalidBuffer) {
-            state_.get()->free_.push(num);
+    void put(DataPtr ptr) {
+        if (ptr && ptr.buffer->usage_counter.fetch_sub(1) == 1) {
+            state_.get()->free_.push(ptr.buffer->number);
+        }
+    }
+
+private:
+    DataPtr try_fetch(size_t size, Buffer* buffer) {
+        if (!buffer) {
+            return {};
+        }
+        DataPtr result {
+            .buffer = buffer,
+            .offset = buffer->offset.fetch_add(size)
+        };
+        if (result.offset + size > buffer->data.size()) {
+            return {};
+        } else {
+            buffer->usage_counter.fetch_add(1);
+            return result;
         }
     }
 
 private:
     struct State {
-        std::vector<std::unique_ptr<bus::GenericBuffer>> buffers_;
+        std::vector<std::unique_ptr<Buffer>> buffers_;
         std::stack<size_t> free_;
     };
 
     internal::ExclusiveWrapper<State> state_;
-    const size_t start_size_;
-};
-
-class ScopedBuffer {
-public:
-    ScopedBuffer() = default;
-
-    ScopedBuffer(BufferPool& pool, size_t size)
-        : pool_(&pool)
-    {
-        std::tie(num_, buf_) = pool_->take();
-        buf_->resize(size);
-    }
-
-    ScopedBuffer(const ScopedBuffer&) = delete;
-
-    ScopedBuffer(ScopedBuffer&& other)
-    {
-        std::swap(pool_, other.pool_);
-        std::swap(buf_, other.buf_);
-        std::swap(num_, other.num_);
-    }
-
-    void operator = (ScopedBuffer&& other) {
-        std::swap(pool_, other.pool_);
-        std::swap(buf_, other.buf_);
-        std::swap(num_, other.num_);
-    }
-
-    bool initialized() {
-        return pool_ != nullptr;
-    }
-
-    GenericBuffer& get() {
-        return *buf_;
-    }
-
-    ~ScopedBuffer() {
-        if (pool_) {
-            pool_->put(num_);
-        }
-    }
-
-private:
-    size_t num_ = BufferPool::kInvalidBuffer;
-    GenericBuffer* buf_ = nullptr;
-    BufferPool* pool_ = nullptr;
+    const size_t size_;
+    std::atomic<Buffer*> head_ = nullptr;
 };
 
 class SharedView {
 public:
-    SharedView(ScopedBuffer buf) {
-        std::unique_ptr<ScopedBuffer> ptr(new ScopedBuffer(std::move(buf)));
-        buf_ = std::move(ptr);
-        view_ = {buf_->get().data(), buf_->get().size()};
+    SharedView() = default;
+
+    SharedView(BufferPool& pool, size_t size)
+        : pool_(&pool)
+        , ptr_(pool.take(size))
+        , size_(size)
+    {
+        data_ = ptr_.buffer->data.data() + ptr_.offset;
     }
 
-    SharedView(const SharedView&) = default;
+    SharedView(const SharedView& oth)
+        : SharedView()
+    {
+        mem_copy(oth);
+        ref();
+    }
+
+    void operator = (const SharedView& oth) {
+        mem_copy(oth);
+        ref();
+    }
+
+    SharedView(SharedView&& oth) {
+        mem_swap(oth);
+    }
+
+    ~SharedView() {
+        unref();
+    }
+
+    bool initialized() {
+        return pool_;
+    }
 
     SharedView slice(size_t start, size_t size) const {
         SharedView result = *this;
-        result.view_ = { view_.data() + start, size };
+        result.data_ = data_ + start;
+        result.size_ = size;
         return result;
     }
 
     SharedView skip(size_t start) const {
-        return slice(start, get().size() - start);
+        return slice(start, size() - start);
     }
 
     SharedView resize(size_t size) {
         return slice(0, size);
     }
 
-    const char* data() const {
-        return view_.data();
+    char* data() const {
+        return data_;
     }
 
     size_t size() const {
-        return view_.size();
+        return size_;
     }
 
-    std::string_view get() const {
-        return view_;
+    std::string_view view() const {
+        return { data_, size_ };
     }
 
 private:
-    std::shared_ptr<ScopedBuffer> buf_;
-    std::string_view view_;
+    void mem_reset() {
+        pool_ = nullptr;
+        ptr_ = {};
+        size_ = 0;
+    }
+
+    void unref() {
+        if (pool_) {
+            pool_->put(ptr_);
+        }
+    }
+
+    void ref() {
+        if (pool_) {
+            ptr_.buffer->usage_counter.fetch_add(1);
+        }
+    }
+
+    void mem_copy(const SharedView& oth) {
+        std::tie(pool_, ptr_, data_, size_) = std::tie(oth.pool_, oth.ptr_, oth.data_, oth.size_);
+    }
+
+    void mem_swap(SharedView& view) {
+        std::swap(pool_, view.pool_);
+        std::swap(ptr_, view.ptr_);
+        std::swap(data_, view.data_);
+        std::swap(size_, view.size_);
+    }
+
+private:
+    BufferPool* pool_ = nullptr;
+    BufferPool::DataPtr ptr_;
+    char* data_ = nullptr;
+    size_t size_ = 0;
 };
 
 }
