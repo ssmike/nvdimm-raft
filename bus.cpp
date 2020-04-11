@@ -74,7 +74,7 @@ public:
         for (size_t i = 0; i < 2; ++i) {
             EndpointManager::IncomingConnection conn = endpoint_manager_.accept(listensock_);
             if (conn.sock_.get() >= 0) {
-                uint64_t id = pool_.make_id(); 
+                uint64_t id = pool_.make_id();
                 auto data = pool_.add(conn.sock_.release(), id, conn.endpoint_);
 
                 epoll_add(data->socket.get(), id);
