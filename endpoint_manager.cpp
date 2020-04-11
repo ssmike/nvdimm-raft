@@ -107,9 +107,9 @@ int EndpointManager::register_endpoint(std::string addr, int port) {
     std::optional<int> result = std::nullopt;
     auto state = impl_->state_.get();
     for (addrinfo* i = info; i != nullptr; i = i->ai_next) {
-        sockaddr_in6 addr = *reinterpret_cast<sockaddr_in6*>(info->ai_addr);
-        addr.sin6_port = htons(port);
         if (info->ai_family == AF_INET6) {
+            sockaddr_in6 addr = *reinterpret_cast<sockaddr_in6*>(info->ai_addr);
+            addr.sin6_port = htons(port);
             if (!result) {
                 result = state->resolve(&addr);
             }
