@@ -16,7 +16,8 @@ add_library(bus
     connect_pool.h connect_pool.cpp
     endpoint_manager.h endpoint_manager.cpp
     error.h error.cpp
-    util.h util.cpp)
+    util.h util.cpp
+    ${PROTO_HDRS} ${PROTO_SRCS})
 
 set_property(TARGET bus PROPERTY CXX_STANDARD 17)
 
