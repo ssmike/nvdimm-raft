@@ -37,7 +37,7 @@ void set_nodelay(int socket) {
 
 class EndpointManager::Impl {
 public:
-    SocketHolder async_connect(int dest) {
+    void async_connect(SocketHolder& sock, int dest) {
         sockaddr_in6 addr;
         {
             auto state = state_.get();
@@ -47,12 +47,9 @@ public:
             addr = state->endpoints_[dest];
         }
 
-        SocketHolder sock = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        CHECK_ERRNO(sock.get() >= 0);
         int status = connect(sock.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(sockaddr_in6));
         CHECK_ERRNO(status == 0 || errno == EINPROGRESS || errno == EINTR);
         set_nodelay(sock.get());
-        return sock;
     }
 
     EndpointManager::IncomingConnection accept(int listensock) {
@@ -127,8 +124,14 @@ int EndpointManager::register_endpoint(std::string addr, int port) {
 
 }
 
-SocketHolder EndpointManager::async_connect(int dest) {
-    return impl_->async_connect(dest);
+SocketHolder EndpointManager::socket(int) {
+    SocketHolder sock = ::socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    CHECK_ERRNO(sock.get() >= 0);
+    return sock;
+}
+
+void EndpointManager::async_connect(SocketHolder& sock, int dest) {
+    impl_->async_connect(sock, dest);
 }
 
 EndpointManager::IncomingConnection EndpointManager::accept(int listen_socket) {

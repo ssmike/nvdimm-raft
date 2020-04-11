@@ -92,8 +92,9 @@ public:
         size_t pool_size = pool_.count_connections(dest);
         if (pool_size < fixed_pool_size_) {
             for (; pool_size < fixed_pool_size_; ++pool_size) {
-                SocketHolder sock = endpoint_manager_.async_connect(dest);
+                SocketHolder sock = endpoint_manager_.socket(dest);
                 uint64_t id = epoll_add(sock.get());
+                endpoint_manager_.async_connect(sock, dest);
                 pool_.add(sock.release(), id, dest);
             }
         }
@@ -112,6 +113,9 @@ public:
             }
             if (expected > max_message_size_) {
                 throw BusError("too big message");
+            }
+            if (!data->ingress_buf.initialized()) {
+                data->ingress_buf = ScopedBuffer(buffer_pool_);
             }
             data->ingress_buf.get().resize(expected);
             expected -= data->ingress_offset;
@@ -143,6 +147,7 @@ public:
                 auto messages = pending_messages_.get();
                 auto& queue = (*messages)[data->dest];
                 if (queue.empty()) {
+                    pool_.set_available(data->id);
                     return;
                 }
                 egress_data->message = queue.front();
@@ -238,19 +243,29 @@ public:
 
     void send(int dest, SharedView message) {
         fix_pool_size(dest);
-        if (auto data = pool_.take_available(dest)) {
-            auto egress_data = data->egress_data.get();
-            egress_data->message = std::move(message);
-            egress_data->offset = 0;
-            try_write_message(data, egress_data);
-        } else {
-            (*pending_messages_.get())[dest].push(std::move(message));
+        ConnData* available_connection;
+        // serialize on messages to avoid double-writing message
+        {
+            auto messages = pending_messages_.get();
+            available_connection = pool_.take_available(dest);
+            if (available_connection) {
+                auto egress_data = available_connection->egress_data.get();
+                egress_data->message = std::move(message);
+                egress_data->offset = 0;
+            } else {
+                (*messages)[dest].push(std::move(message));
+            }
+        }
+
+        if (available_connection) {
+            auto egress_data = available_connection->egress_data.get();
+            try_write_message(available_connection, egress_data);
         }
     }
 
-    uint64_t epoll_add(int fd) {
+    uint64_t epoll_add(int fd, uint32_t mask = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLET) {
         epoll_event evt;
-        evt.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLET;
+        evt.events = mask;
         evt.data.u64 = pool_.make_id();
         CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, fd, &evt) == 0);
         return evt.data.u64;

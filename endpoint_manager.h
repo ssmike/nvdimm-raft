@@ -21,9 +21,12 @@ public:
 public:
     EndpointManager();
 
+
+
     int register_endpoint(std::string addr, int port);
 
-    SocketHolder async_connect(int dest);
+    SocketHolder socket(int dest);
+    void async_connect(SocketHolder& sock, int dest);
     IncomingConnection accept(int listen_socket);
 
     ~EndpointManager();
