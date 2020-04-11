@@ -65,17 +65,20 @@ public:
     ScopedBuffer(const ScopedBuffer&) = delete;
 
     ScopedBuffer(ScopedBuffer&& other)
-        : pool_(other.pool_)
     {
-        pool_ = other.pool_;
-        buf_ = other.buf_;
-        other.num_ = BufferPool::kInvalidBuffer;
+        std::swap(pool_, other.pool_);
+        std::swap(buf_, other.buf_);
+        std::swap(num_, other.num_);
     }
 
     void operator = (ScopedBuffer&& other) {
         std::swap(pool_, other.pool_);
         std::swap(buf_, other.buf_);
         std::swap(num_, other.num_);
+    }
+
+    bool initialized() {
+        return pool_ != nullptr;
     }
 
     GenericBuffer& get() {
