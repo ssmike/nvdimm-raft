@@ -31,17 +31,17 @@ public:
     };
 
 public:
-    PoolItem* select(uint64_t id) {
+    std::shared_ptr<PoolItem> select(uint64_t id) {
         auto it = by_id_.find(id);
         if (it == by_id_.end()) {
             return nullptr;
         } else {
-            return &it->second;
+            return it->second;
         }
     }
 
 public:
-    std::unordered_map<uint64_t, PoolItem> by_id_;
+    std::unordered_map<uint64_t, std::shared_ptr<PoolItem>> by_id_;
     std::unordered_map<int, std::list<uint64_t>> by_dest_;
     std::list<uint64_t> by_usage_;
 };
@@ -55,7 +55,7 @@ size_t ConnectPool::make_id() {
     return id_.fetch_add(1, std::memory_order_seq_cst);
 }
 
-void ConnectPool::add(SocketHolder holder, uint64_t id, int dest) {
+std::shared_ptr<ConnData> ConnectPool::add(SocketHolder holder, uint64_t id, int dest) {
     auto impl = impl_.get();
     if (impl->by_id_.find(id) != impl->by_id_.end()) {
         throw BusError("duplicate id");
@@ -65,23 +65,25 @@ void ConnectPool::add(SocketHolder holder, uint64_t id, int dest) {
     auto hint_iterator =
         impl->by_dest_[dest].insert(impl->by_dest_[dest].begin(), id);
 
-    auto& data = impl->by_id_[id];
-    data.id = id;
-    data.socket = std::move(holder);
-    data.dest = dest;
+    auto& data = impl->by_id_[id] = std::make_shared<Impl::PoolItem>();
+    data->id = id;
+    data->socket = std::move(holder);
+    data->dest = dest;
 
-    data.usage_list_pos_ = usage_iterator;
-    data.by_dest_pos_ = hint_iterator;
+    data->usage_list_pos_ = usage_iterator;
+    data->by_dest_pos_ = hint_iterator;
 
     size_.fetch_add(1, std::memory_order_seq_cst);
+
+    return data;
 }
 
-ConnData* ConnectPool::select(uint64_t id) {
+std::shared_ptr<ConnData> ConnectPool::select(uint64_t id) {
     auto impl = impl_.get();
     return impl->select(id);
 }
 
-ConnData* ConnectPool::take_available(int dest) {
+std::shared_ptr<ConnData> ConnectPool::take_available(int dest) {
     auto impl = impl_.get();
     auto it = impl->by_dest_.find(dest);
     if (it == impl->by_dest_.end()) {
@@ -94,7 +96,7 @@ ConnData* ConnectPool::take_available(int dest) {
             return nullptr;
         }
 
-        auto* data = impl->select(*it->second.begin());
+        auto data = impl->select(*it->second.begin());
         if (!data) {
             it->second.erase(it->second.begin());
         } else if (!data->available_) {
@@ -107,7 +109,7 @@ ConnData* ConnectPool::take_available(int dest) {
 
 void ConnectPool::set_available(uint64_t id) {
     auto impl = impl_.get();
-    if (auto* data = impl->select(id)) {
+    if (auto data = impl->select(id)) {
         data->available_ = true;
         auto& d_list = impl->by_dest_[data->dest];
         auto it = d_list.insert(d_list.begin(), id);
@@ -129,10 +131,10 @@ void ConnectPool::close(uint64_t id) {
     auto impl = impl_.get();
     auto it = impl->by_id_.find(id);
     if (it != impl->by_id_.end()) {
-        impl->by_dest_[it->second.dest].erase(it->second.by_dest_pos_);
-        impl->by_usage_.erase(it->second.usage_list_pos_);
-        if (impl->by_dest_[it->second.dest].empty()) {
-            impl->by_dest_.erase(it->second.dest);
+        impl->by_dest_[it->second->dest].erase(it->second->by_dest_pos_);
+        impl->by_usage_.erase(it->second->usage_list_pos_);
+        if (impl->by_dest_[it->second->dest].empty()) {
+            impl->by_dest_.erase(it->second->dest);
         }
         impl->by_id_.erase(it);
     }

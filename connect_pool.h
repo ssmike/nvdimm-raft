@@ -70,12 +70,12 @@ public:
 
     size_t make_id();
 
-    void add(SocketHolder, uint64_t id, int dest);
+    std::shared_ptr<ConnData> add(SocketHolder, uint64_t id, int dest);
 
-    ConnData* select(uint64_t);
+    std::shared_ptr<ConnData> select(uint64_t);
 
     // makes unavailable
-    ConnData* take_available(int dest);
+    std::shared_ptr<ConnData> take_available(int dest);
 
     void set_available(uint64_t);
 

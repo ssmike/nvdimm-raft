@@ -74,10 +74,11 @@ public:
         for (size_t i = 0; i < 2; ++i) {
             EndpointManager::IncomingConnection conn = endpoint_manager_.accept(listensock_);
             if (conn.sock_.get() >= 0) {
-                uint64_t id = epoll_add(conn.sock_.get());
-                pool_.add(conn.sock_.release(), id, conn.endpoint_);
+                uint64_t id = pool_.make_id(); 
+                auto data = pool_.add(conn.sock_.release(), id, conn.endpoint_);
+
+                epoll_add(data->socket.get(), id);
                 pool_.set_available(id);
-                pool_.select(id)->ingress_buf = ScopedBuffer(buffer_pool_);
             } else if (conn.errno_ == EAGAIN) {
                 return;
             } else  if (conn.errno_ == EMFILE || conn.errno_ == ENFILE || conn.errno_ == ENOBUFS || conn.errno_ == ENOMEM) {
@@ -93,9 +94,11 @@ public:
         if (pool_size < fixed_pool_size_) {
             for (; pool_size < fixed_pool_size_; ++pool_size) {
                 SocketHolder sock = endpoint_manager_.socket(dest);
-                uint64_t id = epoll_add(sock.get());
+                uint64_t id = pool_.make_id();
                 endpoint_manager_.async_connect(sock, dest);
-                pool_.add(sock.release(), id, dest);
+                auto data = pool_.add(sock.release(), id, dest);
+
+                epoll_add(data->socket.get(), id);
             }
         }
     }
@@ -173,7 +176,7 @@ public:
                 uint64_t id = event_buf[i].data.u64;
                 if (id == listend_id_) {
                     accept_conns();
-                } else if (ConnData* data = pool_.select(id)) {
+                } else if (auto data = pool_.select(id)) {
                     int dest = data->dest;
                     if (event_buf[i].events & EPOLLERR) {
                         pool_.close(id);
@@ -181,10 +184,10 @@ public:
                         continue;
                     }
                     if (event_buf[i].events & EPOLLIN) {
-                        handle_read(data);
+                        handle_read(data.get());
                     }
                     if (data && (event_buf[i].events & EPOLLOUT) != 0) {
-                        handle_write(data);
+                        handle_write(data.get());
                     }
                 }
             }
@@ -243,7 +246,7 @@ public:
 
     void send(int dest, SharedView message) {
         fix_pool_size(dest);
-        ConnData* available_connection;
+        std::shared_ptr<ConnData> available_connection;
         // serialize on messages to avoid double-writing message
         {
             auto messages = pending_messages_.get();
@@ -259,14 +262,14 @@ public:
 
         if (available_connection) {
             auto egress_data = available_connection->egress_data.get();
-            try_write_message(available_connection, egress_data);
+            try_write_message(available_connection.get(), egress_data);
         }
     }
 
-    uint64_t epoll_add(int fd, uint32_t mask = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLET) {
+    uint64_t epoll_add(int fd, uint64_t id) {
         epoll_event evt;
-        evt.events = mask;
-        evt.data.u64 = pool_.make_id();
+        evt.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLET;
+        evt.data.u64 = id;
         CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, fd, &evt) == 0);
         return evt.data.u64;
     }
