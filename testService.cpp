@@ -12,7 +12,7 @@ internal::Event event;
 class SimpleService: ProtoBus {
 public:
     SimpleService(EndpointManager& manager, int port, bool receiver)
-        : ProtoBus(TcpBus::Options{.port = port, .fixed_pool_size = 2}, manager)
+        : ProtoBus(TcpBus::Options{.port = port, .fixed_pool_size = 2}, manager, {.max_batch=2, .max_delay=std::chrono::seconds(1)})
     {
         if (receiver) {
             register_handler<Operation, Operation>(1, [&](Operation op) -> Future<Operation> {
@@ -27,7 +27,7 @@ public:
         op.set_key("key");
         op.set_data("value");
 
-        send<Operation, Operation>(op, endpoint, 1, std::chrono::duration<double>(1))
+        send<Operation, Operation>(op, endpoint, 1, std::chrono::seconds(4))
             .subscribe([=](ErrorT<Operation>& op) {
                     assert(op);
                     assert(op.unwrap().key() == "key - mirrored");

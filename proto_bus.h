@@ -10,7 +10,13 @@ namespace bus {
 
 class ProtoBus {
 public:
-    ProtoBus(TcpBus::Options opts, EndpointManager& manager);
+    struct BatchOptions {
+        size_t max_batch = 1;
+        std::chrono::system_clock::duration max_delay = std::chrono::hours(1);
+    };
+
+public:
+    ProtoBus(TcpBus::Options opts, EndpointManager& manager, BatchOptions batch_opts);
     ~ProtoBus();
 
     template<typename RequestProto, typename ResponseProto>
