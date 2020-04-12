@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <sys/epoll.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
@@ -34,6 +35,17 @@ public:
     {
         epollfd_ = epoll_create1(EPOLL_CLOEXEC);
         CHECK_ERRNO(epollfd_ >= 0);
+        breakfd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        CHECK_ERRNO(breakfd_ >= 0);
+
+        {
+            epoll_event evt;
+            evt.events = EPOLLIN;
+            evt.data.u64 = break_id_ = pool_.make_id();
+            CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, breakfd_, &evt) == 0);
+        }
+
+        listen_id_ = pool_.make_id();
     }
 
     void start(std::function<void(ConnHandle, SharedView)> handler) {
@@ -60,7 +72,7 @@ public:
         {
             epoll_event evt;
             evt.events = EPOLLIN;
-            evt.data.u64 = listend_id_ = pool_.make_id();
+            evt.data.u64 = listen_id_;
             CHECK_ERRNO(epoll_ctl(epollfd_, EPOLL_CTL_ADD, listensock_, &evt) == 0);
         }
     }
@@ -163,8 +175,7 @@ public:
                     return;
                 }
                 egress_data->message = queue.front();
-                egress_data->offset = 0;
-                (*messages)[data->endpoint].pop();
+                egress_data->offset = 0; (*messages)[data->endpoint].pop();
             }
             if (!try_write_message(data, egress_data)) {
                 return;
@@ -174,7 +185,8 @@ public:
 
     void loop() {
         std::vector<epoll_event> event_buf;
-        while (true) {
+        bool to_break = false;
+        while (!to_break) {
             event_buf.resize(pool_.count_connections() + 1);
             int ready = epoll_wait(epollfd_, event_buf.data(), event_buf.size(), -1);
             if (errno == EINTR) {
@@ -183,7 +195,11 @@ public:
             CHECK_ERRNO(ready >= 0);
             for (size_t i = 0; i < ready; ++i) {
                 uint64_t id = event_buf[i].data.u64;
-                if (id == listend_id_) {
+                if (id == break_id_) {
+                    uint64_t val;
+                    CHECK_ERRNO(read(breakfd_, &val, sizeof(val)) == sizeof(val));
+                    to_break = true;
+                } else if (id == listen_id_) {
                     accept_conns();
                 } else if (auto data = pool_.select(id)) {
                     int endpoint = data->endpoint;
@@ -300,7 +316,10 @@ public:
 
     int epollfd_;
     int listensock_;
-    size_t listend_id_;
+    int breakfd_;
+
+    size_t break_id_;
+    size_t listen_id_;
 
     const int port_;
     const size_t listener_backlog_;
@@ -350,6 +369,11 @@ void TcpBus::close(uint64_t conn_id) {
 
 void TcpBus::loop() {
     impl_->loop();
+}
+
+void TcpBus::to_break() {
+    uint64_t val = 1;
+    CHECK_ERRNO(write(impl_->breakfd_, &val, sizeof(val)) == sizeof(val));
 }
 
 TcpBus::~TcpBus() = default;

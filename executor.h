@@ -38,6 +38,8 @@ public:
         shot_down_.store(true);
         ready_.notify();
         shot_down_event_.wait();
+
+        thread_.join();
     }
 
 private:

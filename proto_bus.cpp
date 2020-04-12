@@ -159,6 +159,8 @@ namespace bus {
     {
     }
 
-    ProtoBus::~ProtoBus() = default;
+    ProtoBus::~ProtoBus() {
+        impl_->bus_.to_break();
+    }
 
 }

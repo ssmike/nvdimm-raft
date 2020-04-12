@@ -38,6 +38,7 @@ public:
     void rebind(uint64_t conn_id, int new_endpoint);
 
     void loop();
+    void to_break();
 
     ~TcpBus();
 
