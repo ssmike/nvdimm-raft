@@ -6,49 +6,74 @@
 namespace bus {
     class ProtoBus::Impl {
     public:
-        Impl(TcpBus::Options opts, EndpointManager& manager, BatchOptions batch_opts)
-            : pool_{ opts.max_message_size }
-            , bus_(opts, pool_, manager)
-            , batch_opts_(batch_opts)
+        Impl(Options opts, EndpointManager& manager)
+            : greeter_(opts.greeter)
+            , endpoint_manager_(manager)
+            , pool_{ 2 * opts.tcp_opts.max_message_size }
+            , bus_(opts.tcp_opts, pool_, manager)
+            , batch_opts_(opts.batch_opts)
             , loop_([&] { bus_.loop(); }, std::chrono::seconds::zero())
         {
+            bus_.set_greeter([=] (int dest) {
+                    detail::Greeter greeter;
+                    greeter.set_port(opts.tcp_opts.port);
+                    greeter.set_force_endpoint(greeter_.has_value());
+                    if (greeter_) {
+                        greeter.set_endpoint_id(greeter_.value());
+                    }
+                    auto result = SharedView(pool_, greeter.ByteSizeLong());
+                    greeter.SerializeToArray(result.data(), result.size());
+                    return result;
+                });
             bus_.start([=](auto d, auto v) { this->handle(d, v); });
             loop_.start();
             exc_.schedule([=] { timed_flush_batch(); }, batch_opts_.max_delay);
         }
 
-        void handle(int dest, SharedView view) {
-            bus::detail::MessageBatch batch;
-            batch.ParseFromArray(view.data(), view.size());
-            std::cerr << "received from " << dest << " " << batch.DebugString() << std::endl;
-            for (auto& header : *batch.mutable_item()) {
-                if (header.type() == detail::Message::REQUEST) {
-                    if (handlers_.size() <= header.method() || !handlers_[header.method()]) {
-                        throw BusError("invalid handler number");
+        void handle(TcpBus::ConnHandle handle, SharedView view) {
+            if (endpoint_manager_.transient(handle.endpoint)) {
+                bus::detail::Greeter greeter;
+                greeter.ParseFromArray(view.data(), view.size());
+                if (greeter.force_endpoint()) {
+                    bus_.rebind(handle.conn_id, greeter.endpoint_id());
+                } else {
+                    int dest = endpoint_manager_.resolve(handle.socket, greeter.port());
+                    if (!endpoint_manager_.transient(dest)) {
+                        bus_.rebind(handle.conn_id, dest);
                     } else {
-                        handlers_[header.method()](dest, header.seq_id(), std::move(*header.mutable_data()));
+                        bus_.close(handle.conn_id);
                     }
                 }
-                if (header.type() == detail::Message::RESPONSE) {
-                    auto reqs = sent_requests_.get();
-                    auto it = reqs->find(header.seq_id());
-                    if (it != reqs->end()) {
-                        it->second.set_value(ErrorT<std::string>::value(std::move(*header.mutable_data())));
-                        reqs->erase(it);
+            } else {
+                bus::detail::MessageBatch batch;
+                batch.ParseFromArray(view.data(), view.size());
+                for (auto& header : *batch.mutable_item()) {
+                    if (header.type() == detail::Message::REQUEST) {
+                        if (handlers_.size() <= header.method() || !handlers_[header.method()]) {
+                            throw BusError("invalid handler number");
+                        } else {
+                            handlers_[header.method()](handle.endpoint, header.seq_id(), std::move(*header.mutable_data()));
+                        }
+                    }
+                    if (header.type() == detail::Message::RESPONSE) {
+                        auto reqs = sent_requests_.get();
+                        auto it = reqs->find(header.seq_id());
+                        if (it != reqs->end()) {
+                            it->second.set_value(ErrorT<std::string>::value(std::move(*header.mutable_data())));
+                            reqs->erase(it);
+                        }
                     }
                 }
             }
         }
 
         void flush_batch(int dest, detail::MessageBatch batch) {
-            std::cerr << "sent to " << dest << " : " << batch.DebugString() << std::endl;
             auto buffer = SharedView(pool_, batch.ByteSizeLong());
             batch.SerializeToArray(buffer.data(), buffer.size());
             bus_.send(dest, std::move(buffer));
         }
 
         void timed_flush_batch() {
-            std::cerr << "timed flush" << std::endl;
             exc_.schedule([=] { timed_flush_batch(); }, batch_opts_.max_delay);
             std::unordered_map<int, detail::MessageBatch> accumulated;
             accumulated_.get()->swap(accumulated);
@@ -76,6 +101,9 @@ namespace bus {
         }
 
     public:
+        std::optional<uint64_t> greeter_;
+
+        EndpointManager& endpoint_manager_;
         BufferPool pool_;
         TcpBus bus_;
         std::vector<std::function<void(int, uint32_t, std::string)>> handlers_;
@@ -126,8 +154,8 @@ namespace bus {
             };
     }
 
-    ProtoBus::ProtoBus(TcpBus::Options opts, EndpointManager& manager, BatchOptions batch_opts)
-        : impl_(new Impl(opts, manager, batch_opts))
+    ProtoBus::ProtoBus(Options opts, EndpointManager& manager)
+        : impl_(new Impl(opts, manager))
     {
     }
 

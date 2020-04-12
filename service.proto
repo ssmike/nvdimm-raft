@@ -2,6 +2,12 @@ syntax = "proto3";
 
 package bus.detail;
 
+message Greeter {
+    uint32 port = 1;
+    uint64 endpoint_id = 2;
+    bool force_endpoint = 3;
+}
+
 message Message {
     enum Type {
         REQUEST = 0;

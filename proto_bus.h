@@ -15,8 +15,14 @@ public:
         std::chrono::system_clock::duration max_delay = std::chrono::hours(1);
     };
 
+    struct Options {
+        TcpBus::Options tcp_opts;
+        BatchOptions batch_opts;
+        std::optional<uint64_t> greeter;
+    };
+
 public:
-    ProtoBus(TcpBus::Options opts, EndpointManager& manager, BatchOptions batch_opts);
+    ProtoBus(Options opts, EndpointManager& manager);
     ~ProtoBus();
 
     template<typename RequestProto, typename ResponseProto>

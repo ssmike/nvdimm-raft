@@ -21,7 +21,7 @@ int main() {
 
         size_t messages_received = 0;
 
-        first.start([&](int endp, SharedView view) {
+        first.start([&](auto endp, SharedView view) {
                 Operation op2;
                 op2.ParseFromArray(view.data(), view.size());
                 assert(op2.key() == "key");
@@ -35,6 +35,7 @@ int main() {
         first.loop();
     });
 
+    int endpoint = manager.register_endpoint("::1", 4001);
     for (size_t i = 0; i < messages_count; ++i) {
         Operation op;
         op.set_data("data");
@@ -43,7 +44,7 @@ int main() {
         SharedView buffer{bufferPool, op.ByteSizeLong()};
         op.SerializeToArray(buffer.data(), buffer.size());
 
-        second.send(manager.register_endpoint("::1", 4001), std::move(buffer));
+        second.send(endpoint, std::move(buffer));
     }
 
     second.loop();

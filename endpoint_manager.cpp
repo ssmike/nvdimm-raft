@@ -35,6 +35,8 @@ void set_nodelay(int socket) {
       setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags)) == 0);
 }
 
+constexpr int v6_unbound = -1;
+
 class EndpointManager::Impl {
 public:
     void async_connect(SocketHolder& sock, int dest) {
@@ -52,17 +54,25 @@ public:
         set_nodelay(sock.get());
     }
 
-    EndpointManager::IncomingConnection accept(int listensock) {
+    int resolve(int sock, int port) {
         sockaddr_in6 addr;
         socklen_t addrlen = sizeof(addr);
+        int res = getpeername(sock, reinterpret_cast<struct sockaddr*>(&addr), &addrlen);
+        if (res != 0 || addrlen != sizeof(addr) || addr.sin6_family != AF_INET6) {
+            return v6_unbound;
+        } else {
+            addr.sin6_port = htons(port);
+            return state_.get()->resolve(&addr);
+        }
+    }
+
+    EndpointManager::IncomingConnection accept(int listensock) {
         IncomingConnection conn {
-            .sock_ = accept4(listensock, reinterpret_cast<struct sockaddr*>(&addr), &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC),
+            .sock_ = accept4(listensock, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC),
+            .endpoint_ = v6_unbound
         };
         conn.errno_ = errno;
-        if (conn.sock_.get() >= 0 && addr.sin6_family == AF_INET6 && addrlen == sizeof(addr)) {
-            conn.endpoint_ = state_.get()->resolve(&addr);
-            return conn;
-        } else {
+        if (conn.sock_.get() < 0) {
             conn.sock_ = SocketHolder();
         }
         return conn;
@@ -132,6 +142,10 @@ SocketHolder EndpointManager::socket(int) {
 
 void EndpointManager::async_connect(SocketHolder& sock, int dest) {
     impl_->async_connect(sock, dest);
+}
+
+int EndpointManager::resolve(int sock, int port) {
+    return impl_->resolve(sock, port);
 }
 
 EndpointManager::IncomingConnection EndpointManager::accept(int listen_socket) {

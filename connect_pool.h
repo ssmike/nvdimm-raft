@@ -84,6 +84,8 @@ public:
     size_t count_connections(int dest);
     size_t count_connections();
 
+    void rebind(uint64_t, int dest);
+
     void close(uint64_t);
     void close_old_conns(size_t cnt);
 

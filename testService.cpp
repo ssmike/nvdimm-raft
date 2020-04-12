@@ -12,7 +12,7 @@ internal::Event event;
 class SimpleService: ProtoBus {
 public:
     SimpleService(EndpointManager& manager, int port, bool receiver)
-        : ProtoBus(TcpBus::Options{.port = port, .fixed_pool_size = 2}, manager, {.max_batch=2, .max_delay=std::chrono::seconds(1)})
+        : ProtoBus({.tcp_opts=TcpBus::Options{.port=port, .fixed_pool_size=2}, .batch_opts={.max_batch=2, .max_delay=std::chrono::seconds(1)}}, manager)
     {
         if (receiver) {
             register_handler<Operation, Operation>(1, [&](Operation op) -> Future<Operation> {

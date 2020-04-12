@@ -18,12 +18,23 @@ public:
         size_t max_message_size = 4098;
     };
 
+    struct ConnHandle {
+        int endpoint;
+        int socket;
+        uint64_t conn_id;
+    };
+
 public:
     TcpBus(Options, BufferPool&, EndpointManager&);
 
-    void start(std::function<void(int, SharedView)>);
+    void start(std::function<void(ConnHandle, SharedView)>);
 
     void send(int dest, SharedView);
+
+    // greeter interface
+    void set_greeter(std::function<std::optional<SharedView>(int dest)>);
+    void close(uint64_t conn_id);
+    void rebind(uint64_t conn_id, int new_dest);
 
     void loop();
 

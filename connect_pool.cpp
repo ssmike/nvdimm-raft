@@ -63,7 +63,7 @@ std::shared_ptr<ConnData> ConnectPool::add(SocketHolder holder, uint64_t id, int
 
     auto usage_iterator = impl->by_usage_.insert(impl->by_usage_.begin(), id);
     auto hint_iterator =
-        impl->by_dest_[dest].insert(impl->by_dest_[dest].begin(), id);
+        impl->by_dest_[dest].insert(impl->by_dest_[dest].end(), id);
 
     auto& data = impl->by_id_[id] = std::make_shared<Impl::PoolItem>();
     data->id = id;
@@ -80,7 +80,23 @@ std::shared_ptr<ConnData> ConnectPool::add(SocketHolder holder, uint64_t id, int
 
 std::shared_ptr<ConnData> ConnectPool::select(uint64_t id) {
     auto impl = impl_.get();
-    return impl->select(id);
+    auto data = impl->select(id);
+    impl->by_usage_.erase(data->usage_list_pos_);
+    data->usage_list_pos_ = impl->by_usage_.insert(impl->by_usage_.begin(), id);
+    return data;
+}
+
+void ConnectPool::rebind(uint64_t id, int dest) {
+    auto impl = impl_.get();
+    auto data = impl->select(id);
+    impl->by_dest_[data->dest].erase(data->by_dest_pos_);
+    data->dest = dest;
+    if (data->available_) {
+        data->by_dest_pos_ = impl->by_dest_[dest].insert(impl->by_dest_[dest].begin(), id);
+    } else {
+        data->by_dest_pos_ = impl->by_dest_[dest].insert(impl->by_dest_[dest].end(), id);
+    }
+
 }
 
 std::shared_ptr<ConnData> ConnectPool::take_available(int dest) {
