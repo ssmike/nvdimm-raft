@@ -13,3 +13,7 @@ message Message {
     uint32 method = 3;
     bytes data = 4;
 }
+
+message MessageBatch {
+    repeated Message item = 1;
+}

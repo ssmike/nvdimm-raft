@@ -3,24 +3,15 @@
 #include "bus.h"
 #include "error.h"
 #include "future.h"
-#include "executor.h"
 
-#include <chrono>
-#include <vector>
 #include <functional>
 
 namespace bus {
 
 class ProtoBus {
 public:
-    ProtoBus(TcpBus::Options opts, EndpointManager& manager)
-        : pool_{ opts.max_message_size }
-        , bus_(opts, pool_, manager)
-        , loop_([&] { bus_.loop(); }, std::chrono::seconds::zero())
-    {
-        bus_.start([=](auto d, auto v) { this->handle(d, v); });
-        loop_.start();
-    }
+    ProtoBus(TcpBus::Options opts, EndpointManager& manager);
+    ~ProtoBus();
 
     template<typename RequestProto, typename ResponseProto>
     Future<ErrorT<ResponseProto>> send(RequestProto proto, int dest, uint64_t method, std::chrono::duration<double> timeout) {
@@ -51,18 +42,9 @@ private:
 
     void register_raw_handler(uint32_t method, std::function<Future<std::string>(std::string)> handler);
 
-    void handle(int dest, SharedView view);
-
 private:
-    BufferPool pool_;
-    TcpBus bus_;
-    std::vector<std::function<void(int, uint32_t, std::string)>> handlers_;
-    internal::DelayedExecutor exc_;
-
-    internal::ExclusiveWrapper<std::unordered_map<uint64_t, Promise<ErrorT<std::string>>>> sent_requests_;
-    std::atomic<uint64_t> seq_id_ = 0;
-
-    internal::PeriodicExecutor loop_;
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }
