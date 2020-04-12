@@ -14,7 +14,7 @@ namespace bus {
             , batch_opts_(opts.batch_opts)
             , loop_([&] { bus_.loop(); }, std::chrono::seconds::zero())
         {
-            bus_.set_greeter([=] (int dest) {
+            bus_.set_greeter([=] (int endpoint) {
                     detail::Greeter greeter;
                     greeter.set_port(opts.tcp_opts.port);
                     greeter.set_force_endpoint(greeter_.has_value());
@@ -37,9 +37,9 @@ namespace bus {
                 if (greeter.force_endpoint()) {
                     bus_.rebind(handle.conn_id, greeter.endpoint_id());
                 } else {
-                    int dest = endpoint_manager_.resolve(handle.socket, greeter.port());
-                    if (!endpoint_manager_.transient(dest)) {
-                        bus_.rebind(handle.conn_id, dest);
+                    int endpoint = endpoint_manager_.resolve(handle.socket, greeter.port());
+                    if (!endpoint_manager_.transient(endpoint)) {
+                        bus_.rebind(handle.conn_id, endpoint);
                     } else {
                         bus_.close(handle.conn_id);
                     }
@@ -67,26 +67,26 @@ namespace bus {
             }
         }
 
-        void flush_batch(int dest, detail::MessageBatch batch) {
+        void flush_batch(int endpoint, detail::MessageBatch batch) {
             auto buffer = SharedView(pool_, batch.ByteSizeLong());
             batch.SerializeToArray(buffer.data(), buffer.size());
-            bus_.send(dest, std::move(buffer));
+            bus_.send(endpoint, std::move(buffer));
         }
 
         void timed_flush_batch() {
             exc_.schedule([=] { timed_flush_batch(); }, batch_opts_.max_delay);
             std::unordered_map<int, detail::MessageBatch> accumulated;
             accumulated_.get()->swap(accumulated);
-            for (auto& [dest, batch] : accumulated) {
-                flush_batch(dest, std::move(batch));
+            for (auto& [endpoint, batch] : accumulated) {
+                flush_batch(endpoint, std::move(batch));
             }
         }
 
-        void send_item(int dest, detail::Message item) {
+        void send_item(int endpoint, detail::Message item) {
             std::optional<detail::MessageBatch> to_flush;
             {
                 auto accumulated = accumulated_.get();
-                auto& batch = (*accumulated)[dest];
+                auto& batch = (*accumulated)[endpoint];
                 *batch.add_item() = std::move(item);
 
                 if (batch.item_size() >= batch_opts_.max_batch) {
@@ -96,7 +96,7 @@ namespace bus {
                 }
             }
             if (to_flush.has_value()) {
-                flush_batch(dest, std::move(to_flush.value()));
+                flush_batch(endpoint, std::move(to_flush.value()));
             }
         }
 
@@ -118,14 +118,14 @@ namespace bus {
         internal::PeriodicExecutor loop_;
     };
 
-    Future<ErrorT<std::string>> ProtoBus::send_raw(std::string serialized, int dest, uint64_t method, std::chrono::duration<double> timeout) {
+    Future<ErrorT<std::string>> ProtoBus::send_raw(std::string serialized, int endpoint, uint64_t method, std::chrono::duration<double> timeout) {
         detail::Message header;
         uint64_t seq_id = impl_->seq_id_.fetch_add(1);
         header.set_seq_id(seq_id);
         header.set_type(detail::Message::REQUEST);
         header.set_data(std::move(serialized));
         header.set_method(method);
-        impl_->send_item(dest, std::move(header));
+        impl_->send_item(endpoint, std::move(header));
 
         Promise<ErrorT<std::string>> promise;
         impl_->sent_requests_.get()->insert({ seq_id, promise });
@@ -142,14 +142,14 @@ namespace bus {
     void ProtoBus::register_raw_handler(uint32_t method, std::function<Future<std::string>(std::string)> handler) {
         impl_->handlers_.resize(std::max<uint32_t>(impl_->handlers_.size(), method + 1));
         impl_->handlers_[method] =
-            [handler=std::move(handler), this, method] (int dest, uint32_t seq_id, std::string str) {
+            [handler=std::move(handler), this, method] (int endpoint, uint32_t seq_id, std::string str) {
                 handler(std::move(str)).subscribe([=](std::string& str) {
                     bus::detail::Message header;
                     header.set_type(detail::Message::RESPONSE);
                     header.set_data(str);
                     header.set_seq_id(seq_id);
                     header.set_method(method);
-                    impl_->send_item(dest, std::move(header));
+                    impl_->send_item(endpoint, std::move(header));
                 });
             };
     }

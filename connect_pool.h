@@ -62,7 +62,7 @@ struct ConnData {
 
     SocketHolder socket;
 
-    int dest;
+    int endpoint;
     uint64_t id;
 };
 
@@ -72,19 +72,19 @@ public:
 
     size_t make_id();
 
-    std::shared_ptr<ConnData> add(SocketHolder, uint64_t id, int dest);
+    std::shared_ptr<ConnData> add(SocketHolder, uint64_t id, int endpoint);
 
     std::shared_ptr<ConnData> select(uint64_t);
 
     // makes unavailable
-    std::shared_ptr<ConnData> take_available(int dest);
+    std::shared_ptr<ConnData> take_available(int endpoint);
 
     void set_available(uint64_t);
 
-    size_t count_connections(int dest);
+    size_t count_connections(int endpoint);
     size_t count_connections();
 
-    void rebind(uint64_t, int dest);
+    void rebind(uint64_t, int endpoint);
 
     void close(uint64_t);
     void close_old_conns(size_t cnt);

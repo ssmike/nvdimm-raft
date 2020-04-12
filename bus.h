@@ -29,12 +29,12 @@ public:
 
     void start(std::function<void(ConnHandle, SharedView)>);
 
-    void send(int dest, SharedView);
+    void send(int endpoint, SharedView);
 
     // greeter interface
-    void set_greeter(std::function<std::optional<SharedView>(int dest)>);
+    void set_greeter(std::function<std::optional<SharedView>(int endpoint)>);
     void close(uint64_t conn_id);
-    void rebind(uint64_t conn_id, int new_dest);
+    void rebind(uint64_t conn_id, int new_endpoint);
 
     void loop();
 

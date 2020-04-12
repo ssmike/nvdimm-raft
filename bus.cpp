@@ -89,20 +89,20 @@ public:
         }
     }
 
-    void fix_pool_size(int dest) {
-        if (endpoint_manager_.transient(dest)) {
+    void fix_pool_size(int endpoint) {
+        if (endpoint_manager_.transient(endpoint)) {
             return;
         }
-        size_t pool_size = pool_.count_connections(dest);
+        size_t pool_size = pool_.count_connections(endpoint);
         if (pool_size < fixed_pool_size_) {
             for (; pool_size < fixed_pool_size_; ++pool_size) {
-                SocketHolder sock = endpoint_manager_.socket(dest);
+                SocketHolder sock = endpoint_manager_.socket(endpoint);
                 uint64_t id = pool_.make_id();
-                endpoint_manager_.async_connect(sock, dest);
-                auto data = pool_.add(sock.release(), id, dest);
+                endpoint_manager_.async_connect(sock, endpoint);
+                auto data = pool_.add(sock.release(), id, endpoint);
                 if (greeter_) {
                     auto egress_data = data->egress_data.get();
-                    egress_data->message = greeter_(dest);
+                    egress_data->message = greeter_(endpoint);
                     egress_data->offset = 0;
                 }
                 epoll_add(data->socket.get(), id);
@@ -135,7 +135,7 @@ public:
             if (res >= 0) {
                 data->ingress_offset += res;
                 if (has_header && res == expected) {
-                    handler_({.endpoint=data->dest, .socket=data->socket.get(), .conn_id=data->id}, SharedView(std::move(data->ingress_buf)));
+                    handler_({.endpoint=data->endpoint, .socket=data->socket.get(), .conn_id=data->id}, SharedView(std::move(data->ingress_buf)));
                     data->ingress_buf = SharedView();
                     data->ingress_offset = 0;
                     continue;
@@ -157,14 +157,14 @@ public:
             auto egress_data = data->egress_data.get();
             if (!egress_data->message) {
                 auto messages = pending_messages_.get();
-                auto& queue = (*messages)[data->dest];
+                auto& queue = (*messages)[data->endpoint];
                 if (queue.empty()) {
                     pool_.set_available(data->id);
                     return;
                 }
                 egress_data->message = queue.front();
                 egress_data->offset = 0;
-                (*messages)[data->dest].pop();
+                (*messages)[data->endpoint].pop();
             }
             if (!try_write_message(data, egress_data)) {
                 return;
@@ -186,10 +186,10 @@ public:
                 if (id == listend_id_) {
                     accept_conns();
                 } else if (auto data = pool_.select(id)) {
-                    int dest = data->dest;
+                    int endpoint = data->endpoint;
                     if (event_buf[i].events & EPOLLERR) {
                         pool_.close(id);
-                        fix_pool_size(dest);
+                        fix_pool_size(endpoint);
                         continue;
                     }
                     if (event_buf[i].events & EPOLLIN) {
@@ -252,19 +252,19 @@ public:
         }
     }
 
-    void send(int dest, SharedView message) {
-        fix_pool_size(dest);
+    void send(int endpoint, SharedView message) {
+        fix_pool_size(endpoint);
         std::shared_ptr<ConnData> available_connection;
         // serialize on messages to avoid double-writing message
         {
             auto messages = pending_messages_.get();
-            available_connection = pool_.take_available(dest);
+            available_connection = pool_.take_available(endpoint);
             if (available_connection) {
                 auto egress_data = available_connection->egress_data.get();
                 egress_data->message = std::move(message);
                 egress_data->offset = 0;
             } else {
-                (*messages)[dest].push(std::move(message));
+                (*messages)[endpoint].push(std::move(message));
             }
         }
 
@@ -284,7 +284,7 @@ public:
 
 public:
     std::function<void(ConnHandle, SharedView)> handler_;
-    std::function<std::optional<SharedView>(int dest)> greeter_;
+    std::function<std::optional<SharedView>(int endpoint)> greeter_;
 
     int epollfd_;
     int listensock_;
@@ -309,20 +309,20 @@ TcpBus::TcpBus(Options opts, BufferPool& buffer_pool, EndpointManager& endpoint_
 {
 }
 
-void TcpBus::send(int dest, SharedView buffer) {
-    impl_->send(dest, std::move(buffer));
+void TcpBus::send(int endpoint, SharedView buffer) {
+    impl_->send(endpoint, std::move(buffer));
 }
 
 void TcpBus::start(std::function<void(ConnHandle, SharedView)> handler) {
     impl_->start(std::move(handler));
 }
 
-void TcpBus::set_greeter(std::function<std::optional<SharedView>(int dest)> greeter) {
+void TcpBus::set_greeter(std::function<std::optional<SharedView>(int endpoint)> greeter) {
     impl_->greeter_ = std::move(greeter);
 }
 
-void TcpBus::rebind(uint64_t conn_id, int new_dest) {
-    impl_->pool_.rebind(conn_id, new_dest);
+void TcpBus::rebind(uint64_t conn_id, int new_endpoint) {
+    impl_->pool_.rebind(conn_id, new_endpoint);
 }
 
 void TcpBus::close(uint64_t conn_id) {

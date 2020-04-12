@@ -39,14 +39,14 @@ constexpr int v6_unbound = -1;
 
 class EndpointManager::Impl {
 public:
-    void async_connect(SocketHolder& sock, int dest) {
+    void async_connect(SocketHolder& sock, int endpoint) {
         sockaddr_in6 addr;
         {
             auto state = state_.get();
-            if (dest > state->endpoints_.size()) {
+            if (endpoint > state->endpoints_.size()) {
                 throw BusError("invalid endpoint");
             }
-            addr = state->endpoints_[dest];
+            addr = state->endpoints_[endpoint];
         }
 
         int status = connect(sock.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(sockaddr_in6));
@@ -140,8 +140,8 @@ SocketHolder EndpointManager::socket(int) {
     return sock;
 }
 
-void EndpointManager::async_connect(SocketHolder& sock, int dest) {
-    impl_->async_connect(sock, dest);
+void EndpointManager::async_connect(SocketHolder& sock, int endpoint) {
+    impl_->async_connect(sock, endpoint);
 }
 
 int EndpointManager::resolve(int sock, int port) {

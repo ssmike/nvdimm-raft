@@ -25,12 +25,12 @@ public:
 
     int register_endpoint(std::string addr, int port);
 
-    SocketHolder socket(int dest);
-    void async_connect(SocketHolder& sock, int dest);
+    SocketHolder socket(int endpoint);
+    void async_connect(SocketHolder& sock, int endpoint);
     IncomingConnection accept(int listen_socket);
 
-    bool transient(int dest) {
-        return dest < 0;
+    bool transient(int endpoint) {
+        return endpoint < 0;
     }
 
     int resolve(int sock, int port);
