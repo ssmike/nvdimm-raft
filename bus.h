@@ -30,6 +30,7 @@ public:
     void start(std::function<void(ConnHandle, SharedView)>);
 
     void send(int endpoint, SharedView);
+    void answer(uint64_t conn_id, SharedView);
 
     // greeter interface
     void set_greeter(std::function<std::optional<SharedView>(int endpoint)>);

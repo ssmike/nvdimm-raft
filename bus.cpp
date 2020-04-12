@@ -252,6 +252,18 @@ public:
         }
     }
 
+    void answer(uint64_t conn_id, SharedView message) {
+        if (auto data = pool_.select(conn_id)) {
+            auto egress_data = data->egress_data.get();
+            if (egress_data->message) {
+                throw BusError("answer in bound connection");
+            }
+            egress_data->message = std::move(message);
+            egress_data->offset = 0;
+            try_write_message(data.get(), egress_data);
+        }
+    }
+
     void send(int endpoint, SharedView message) {
         fix_pool_size(endpoint);
         std::shared_ptr<ConnData> available_connection;
@@ -309,7 +321,14 @@ TcpBus::TcpBus(Options opts, BufferPool& buffer_pool, EndpointManager& endpoint_
 {
 }
 
+void TcpBus::answer(uint64_t conn_id, SharedView buffer) {
+    impl_->answer(conn_id, std::move(buffer));
+}
+
 void TcpBus::send(int endpoint, SharedView buffer) {
+    if (impl_->endpoint_manager_.transient(endpoint)) {
+        throw BusError("bad endpoint");
+    }
     impl_->send(endpoint, std::move(buffer));
 }
 
