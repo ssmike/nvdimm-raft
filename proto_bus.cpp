@@ -68,6 +68,9 @@ namespace bus {
         }
 
         void flush_batch(int endpoint, detail::MessageBatch batch) {
+            if (!batch.item_size()) {
+                return;
+            }
             auto buffer = SharedView(pool_, batch.ByteSizeLong());
             batch.SerializeToArray(buffer.data(), buffer.size());
             bus_.send(endpoint, std::move(buffer));
