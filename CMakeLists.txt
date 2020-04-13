@@ -42,5 +42,5 @@ add_executable(main main.cpp ${PROTO_HDRS} ${PROTO_SRCS})
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONCPP REQUIRED jsoncpp)
-target_include_directories(main PUBLIC ${JSONCPP_INCLUDE_DIRECTORIES})
+target_include_directories(main PUBLIC ${JSONCPP_INCLUDE_DIRS})
 target_link_libraries(main ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES} bus)
