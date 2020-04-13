@@ -8,6 +8,9 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 protobuf_generate_cpp(LIB_PROTO_SRCS LIB_PROTO_HDRS service.proto)
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS messages.proto)
 
@@ -20,25 +23,24 @@ add_library(bus
     util.h util.cpp
     ${LIB_PROTO_HDRS} ${LIB_PROTO_SRCS})
 
-set_property(TARGET bus PROPERTY CXX_STANDARD 17)
-
 add_executable(testBus testBus.cpp
     ${PROTO_SRCS}
     ${PROTO_HDRS})
 
-set_property(TARGET testBus PROPERTY CXX_STANDARD 17)
 target_link_libraries(testBus ${Protobuf_LIBRARIES} bus)
 
 add_executable(testService testService.cpp
     ${PROTO_SRCS}
     ${PROTO_HDRS})
 
-set_property(TARGET testService PROPERTY CXX_STANDARD 17)
 target_link_libraries(testService ${Protobuf_LIBRARIES} bus)
 
 add_test(NAME bus COMMAND testBus)
 add_test(NAME service COMMAND testService)
 
-#target_include_directories( main PUBLIC)
+add_executable(main main.cpp ${PROTO_HDRS} ${PROTO_SRCS})
 
-
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSONCPP REQUIRED jsoncpp)
+target_include_directories(main PUBLIC ${JSONCPP_INCLUDE_DIRECTORIES})
+target_link_libraries(main ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES} bus)
