@@ -4,3 +4,26 @@ message Operation {
     bytes key = 1;
     bytes data = 2;
 }
+
+message VoteRpc {
+    uint64 epoch = 1;
+    uint64 record = 2;
+    uint64 wote_for = 3;
+}
+
+message LogRecord {
+    uint64 epoch = 1;
+    uint64 record = 2;
+    bytes key = 3;
+    bytes value = 4;
+    uint64 master = 5;
+}
+
+message AppendRpcs {
+    repeated LogRecord records = 1;
+}
+
+message Response {
+    uint64 epoch = 1;
+    bool success = 2;
+}
