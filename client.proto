@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+message ClientRequest {
+    message Operation {
+        enum Type {
+            READ = 0;
+            WRITE = 1;
+        }
+        Type type = 1;
+        bytes key = 2;
+        bytes value = 3;
+    };
+    repeated Operation operations = 1;
+};

@@ -12,7 +12,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 protobuf_generate_cpp(LIB_PROTO_SRCS LIB_PROTO_HDRS service.proto)
-protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS messages.proto)
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS messages.proto client.proto)
 
 add_library(bus
     bus.h bus.cpp
