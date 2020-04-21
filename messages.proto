@@ -2,7 +2,7 @@ syntax = "proto3";
 
 message Operation {
     bytes key = 1;
-    bytes data = 2;
+    bytes value = 2;
 }
 
 message VoteRpc {
@@ -14,8 +14,7 @@ message VoteRpc {
 message LogRecord {
     uint64 term = 1;
     uint64 ts = 2;
-    bytes key = 3;
-    bytes value = 4;
+    repeated Operation operations = 3;
 }
 
 message AppendRpcs {
@@ -27,7 +26,7 @@ message AppendRpcs {
 
 message Response {
     uint64 term = 1;
-    uint64 commited_ts = 2;
+    uint64 durable_ts = 2;
     bool success = 3;
     uint64 next_ts = 4;
 }
