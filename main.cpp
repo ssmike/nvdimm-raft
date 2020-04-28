@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
+#include <thread>
 #include <filesystem>
 #include <fstream>
 
@@ -39,6 +40,8 @@ private:
             FATAL(fd < 0);
         }
 
+        DescriptorHolder(const DescriptorHolder&) = delete;
+
         int operator* () {
             return fd_;
         }
@@ -56,13 +59,12 @@ private:
 private:
     struct State {
         size_t current_term_ = 0;
-        std::optional<int> vote_for_;
         NodeRole role_ = kFollower;
         uint64_t id_;
 
-        size_t durable_ts_ = 0;
-        size_t applied_ts_ = 0;
-        size_t next_ts_ = 0;
+        ssize_t durable_ts_ = 0;
+        ssize_t applied_ts_ = 0;
+        ssize_t next_ts_ = 0;
 
         std::unordered_map<uint64_t, uint64_t> next_timestamps_;
         std::unordered_map<uint64_t, uint64_t> commited_timestamps_;
@@ -74,6 +76,9 @@ private:
 
         size_t current_changelog_ = 0;
         size_t latest_snapshot = 0;
+
+        std::chrono::system_clock::time_point latest_heartbeat_;
+        std::optional<uint64_t> leader_id_;
 
         Response create_response(bool success) {
             Response response;
@@ -91,9 +96,15 @@ private:
         }
 
         void advance_to(uint64_t ts) {
-            //TODO
-
-            applied_ts_ = ts;
+            if (!buffered_log_.empty()) {
+                ssize_t pos = applied_ts_ - buffered_log_[0].ts() + 1;
+                if (pos >= 0) {
+                    for (; pos < buffered_log_.size() && ts < buffered_log_[pos].ts(); ++pos) {
+                        apply(buffered_log_[pos]);
+                        applied_ts_ = buffered_log_[pos].ts();
+                    }
+                }
+            }
         }
     };
 
@@ -113,8 +124,10 @@ public:
         , buffer_pool_(opts.tcp_opts.max_message_size)
         , options_(options)
         , endpoint_to_id_(options.endpoint_to_id)
+        , elector_([this] { initiate_elections(); }, options.election_timeout)
         , rotator_([this] { rotate(); }, options.rotate_interval)
         , flusher_([this] { flush(); }, options.flush_interval)
+        , sender_([this] { heartbeat_to_followers(); }, options.heartbeat_interval)
     {
         {
             auto state = state_.get();
@@ -126,11 +139,12 @@ public:
             }
         }
         recover();
-        rotator_.start();
+        rotator_.delayed_start();
         flusher_.start();
         register_handler<VoteRpc, Response>(kVote, [&] (int, VoteRpc rpc) { return bus::make_future(vote(rpc)); });
         register_handler<AppendRpcs, Response>(kAppendRpcs, [&](int, AppendRpcs msg) { return handle_append_rpcs(std::move(msg)); });
-        timed_send_heartbeat();
+        sender_.delayed_start();
+        elector_.delayed_start();
     }
 
     bus::internal::Event& shot_down() {
@@ -145,28 +159,46 @@ private:
         } else if (state->current_term_ < rpc.term()) {
             state->role_ = kFollower;
             state->current_term_ = rpc.term();
-            state->vote_for_ = rpc.vote_for();
+            state->leader_id_ = rpc.vote_for();
             return state->create_response(true);
         } else {
-            if (state->vote_for_ && rpc.vote_for() != *state->vote_for_) {
+            if (state->applied_ts_ >= rpc.ts() || (state->leader_id_ && rpc.vote_for() != *state->leader_id_)) {
                 return state->create_response(false);
             } else {
-                state->vote_for_ = rpc.vote_for();
+                state->leader_id_ = rpc.vote_for();
                 return state->create_response(true);
             }
         }
     }
 
-    void schedule_elections() {
-    }
-
     void initiate_elections() {
+        size_t term;
+        {
+            auto state = state_.get();
+            term = state->current_term_;
+            if (state->latest_heartbeat_ + options_.election_timeout > std::chrono::system_clock::now()) {
+                return;
+            }
+        }
+        std::this_thread::sleep_for(options_.election_timeout * (double(rand()) / double(RAND_MAX)));
+        {
+            auto state = state_.get();
+            if (term == state->current_term_) {
+                VoteRpc rpc;
+                for (auto [id, endpoint] : endpoint_to_id_) {
+                    if (id != state->id_) {
+                        send<kVote, Response>(rpc, endpoint, k);
+                    }
+                }
+            }
+        }
     }
 
     bus::Future<Response> handle_append_rpcs(AppendRpcs msg) {
         bus::Future<bool> flush_event;
         {
             auto state = state_.get();
+            state->latest_heartbeat_ = std::chrono::system_clock::now();
             if (state->role_ == kLeader) {
                 if (msg.term() > state->current_term_) {
                     state->current_term_ = msg.term();
@@ -192,11 +224,6 @@ private:
             }
         }
         return flush_event.map([this](bool) { return state_.get()->create_response(true); });
-    }
-
-    void timed_send_heartbeat() {
-        exc_.schedule([this] { timed_send_heartbeat(); }, options_.heartbeat_interval);
-        heartbeat_to_followers();
     }
 
     void heartbeat_to_followers() {
@@ -232,11 +259,14 @@ private:
                             if (response.success()) {
                                 state->next_timestamps_[id] = response.next_ts();
                                 state->commited_timestamps_[id] = response.durable_ts();
-                                uint64_t min_ts = std::numeric_limits<uint64_t>::max();
+                                std::vector<uint64_t> tss;
                                 for (auto [id, ts] : state->commited_timestamps_) {
-                                    min_ts = std::min(min_ts, ts);
+                                    if (id != state->id_) {
+                                        tss.push_back(ts);
+                                    }
                                 }
-                                state->advance_to(min_ts);
+                                std::sort(tss.begin(), tss.end());
+                                state->advance_to(tss[tss.size() / 2 - 1]);
                             } else {
                                 if (response.term() > state->current_term_) {
                                     state->role_ = kFollower;
@@ -380,9 +410,8 @@ private:
         for (auto changelog : changelogs) {
             if (changelog > first_changelog) {
                 auto fname = snapshot_name(changelog);
-                int fd = open(fname.c_str(), O_RDONLY);
-                FATAL(fd < 0);
-                while (auto rec = read_log_record(fd)) {
+                DescriptorHolder fd(open(fname.c_str(), O_RDONLY));
+                while (auto rec = read_log_record(*fd)) {
                     if (rec->ts() == state->next_ts_) {
                         state->apply(*rec);
                         state->next_ts_ = rec->ts() + 1;
@@ -446,9 +475,10 @@ private:
     Options options_;
     bus::internal::ExclusiveWrapper<State> state_;
 
-    bus::internal::DelayedExecutor exc_;
+    bus::internal::PeriodicExecutor elector_;
     bus::internal::PeriodicExecutor flusher_;
     bus::internal::PeriodicExecutor rotator_;
+    bus::internal::PeriodicExecutor sender_;
 
     bus::internal::ExclusiveWrapper<int> log_fd_{kInvalidFd};
 
