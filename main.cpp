@@ -32,6 +32,27 @@ private:
 
     static constexpr int kInvalidFd = -1;
 
+    class DescriptorHolder {
+    public:
+        DescriptorHolder() = default;
+        DescriptorHolder(int fd) : fd_(fd) {
+            FATAL(fd < 0);
+        }
+
+        int operator* () {
+            return fd_;
+        }
+
+        ~DescriptorHolder() {
+            if (fd_ != kInvalidFd) {
+                close(fd_);
+            }
+        }
+
+    private:
+        int fd_ = kInvalidFd;
+    };
+
 private:
     struct State {
         size_t current_term_ = 0;
@@ -61,6 +82,12 @@ private:
             response.set_success(success);
             response.set_next_ts(next_ts_);
             return response;
+        }
+
+        void apply(const LogRecord& rec) {
+            for (auto op : rec.operations()) {
+                fsm_[op.key()] = op.value();
+            }
         }
 
         void advance_to(uint64_t ts) {
@@ -300,6 +327,19 @@ private:
         to_deliver.set_value(true);
     }
 
+    void write_uint64(int fd, uint64_t val) {
+        FATAL(write(fd, &val, sizeof(val)) != sizeof(val));
+    }
+
+    std::optional<uint64_t> read_uint64(int fd) {
+        uint64_t val;
+        if (read(fd, &val, sizeof(val)) != sizeof(val)) {
+            return val;
+        } else {
+            return std::nullopt;
+        }
+    }
+
     void recover() {
         auto state = state_.get();
         std::vector<size_t> snapshots;
@@ -314,18 +354,16 @@ private:
         }
         while (!snapshots.empty()) {
             auto fname = snapshot_name(snapshots.back());
-            int fd = open(fname.c_str(), O_RDONLY);
-            FATAL(fd < 0);
+            DescriptorHolder fd(open(fname.c_str(), O_RDONLY));
             bool valid = true;
-            uint64_t signature;
+            std::optional<uint64_t> size = read_uint64(*fd);
+            std::optional<uint64_t> applied = read_uint64(*fd);
+            valid = size.has_value() && applied.has_value();
             std::unordered_map<std::string, std::string> fsm;
-            valid = valid || read(fd, &signature, sizeof(signature)) == sizeof(signature);
             if (valid) {
-                for (uint64_t i = 0; i < signature; ++i) {
-                    if (auto record = read_log_record(fd)) {
-                        for (auto& op : record->operations()) {
-                            fsm[op.key()] = op.value();
-                        }
+                for (uint64_t i = 0; i < *size; ++i) {
+                    if (auto record = read_log_record(*fd)) {
+                        state->apply(*record);
                     } else {
                         valid = false;
                         break;
@@ -334,9 +372,25 @@ private:
             }
             if (valid) {
                 fsm.swap(state->fsm_);
+                state->durable_ts_ = state->applied_ts_ = *applied;
+                state->next_ts_ = *applied + 1;
             }
         }
+        size_t first_changelog = snapshots.empty() ? 0 : snapshots.back();
         for (auto changelog : changelogs) {
+            if (changelog > first_changelog) {
+                auto fname = snapshot_name(changelog);
+                int fd = open(fname.c_str(), O_RDONLY);
+                FATAL(fd < 0);
+                while (auto rec = read_log_record(fd)) {
+                    if (rec->ts() == state->next_ts_) {
+                        state->apply(*rec);
+                        state->next_ts_ = rec->ts() + 1;
+                        state->applied_ts_ = rec->ts();
+                        state->durable_ts_ = rec->ts();
+                    }
+                }
+            }
         }
     }
 
@@ -372,8 +426,9 @@ private:
         } else {
             FATAL(child < 0);
             State& state = unsafe_state_ptr;
-            uint64_t signature = state.fsm_.size();
-            write(fd, &signature, sizeof(signature));
+            write_uint64(fd, state.fsm_.size());
+            write_uint64(fd, state.applied_ts_);
+            uint64_t applied_ts = state.applied_ts_;
             for (auto [k, v] : state.fsm_) {
                 LogRecord record;
                 auto* op = record.add_operations();
