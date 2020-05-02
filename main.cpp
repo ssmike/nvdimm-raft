@@ -3,6 +3,7 @@
 #include "lock.h"
 #include "executor.h"
 #include "error.h"
+#include "client.pb.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -11,6 +12,7 @@
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#include <map>
 
 #include <json/reader.h>
 
@@ -28,7 +30,8 @@ private:
 
     enum {
         kVote = 1,
-        kAppendRpcs = 2
+        kAppendRpcs = 2,
+        kClientReq = 3,
     };
 
     static constexpr int kInvalidFd = -1;
@@ -60,14 +63,17 @@ private:
     struct State {
         size_t current_term_ = 0;
         NodeRole role_ = kFollower;
-        uint64_t id_;
 
         ssize_t durable_ts_ = 0;
         ssize_t applied_ts_ = 0;
         ssize_t next_ts_ = 0;
 
+        std::set<int> voted_for_me_;
+
         std::unordered_map<uint64_t, uint64_t> next_timestamps_;
         std::unordered_map<uint64_t, uint64_t> commited_timestamps_;
+
+        std::unordered_map<uint64_t, bus::Promise<ClientResponse>> client_requests_;
 
         std::vector<LogRecord> buffered_log_;
         bus::Promise<bool> flush_event_;
@@ -115,15 +121,15 @@ public:
         duration election_timeout;
         duration rotate_interval;
         duration flush_interval;
-        std::unordered_map<int, int> endpoint_to_id;
         std::filesystem::path dir;
+
+        size_t members;
     };
 
     RaftNode(bus::ProtoBus::Options opts, bus::EndpointManager& manager, Options options)
         : bus::ProtoBus(opts, manager)
         , buffer_pool_(opts.tcp_opts.max_message_size)
         , options_(options)
-        , endpoint_to_id_(options.endpoint_to_id)
         , elector_([this] { initiate_elections(); }, options.election_timeout)
         , rotator_([this] { rotate(); }, options.rotate_interval)
         , flusher_([this] { flush(); }, options.flush_interval)
@@ -132,17 +138,20 @@ public:
         {
             auto state = state_.get();
             assert(opts.greeter.has_value());
-            state->id_ = *opts.greeter;
-            for (auto [endpoint, id] : endpoint_to_id_) {
-                state->next_timestamps_[id] = 0;
-                id_to_endpoint_[id] = endpoint;
+            id_ = *opts.greeter;
+            for (size_t id = 0; id < options_.members; ++id) {
+                if (id != id_) {
+                    state->next_timestamps_[id] = 0;
+                }
             }
         }
         recover();
         rotator_.delayed_start();
         flusher_.start();
+        using namespace std::placeholders;
         register_handler<VoteRpc, Response>(kVote, [&] (int, VoteRpc rpc) { return bus::make_future(vote(rpc)); });
-        register_handler<AppendRpcs, Response>(kAppendRpcs, [&](int, AppendRpcs msg) { return handle_append_rpcs(std::move(msg)); });
+        register_handler<AppendRpcs, Response>(kAppendRpcs, std::bind(&RaftNode::handle_append_rpcs, this, _1, _2));
+        register_handler<ClientRequest, ClientResponse>(kClientReq, std::bind(&RaftNode::HandleClientRequest, this, _1, _2));
         sender_.delayed_start();
         elector_.delayed_start();
     }
@@ -171,30 +180,84 @@ private:
         }
     }
 
-    void initiate_elections() {
-        size_t term;
+    bus::Future<ClientResponse> HandleClientRequest(int id, ClientRequest req) {
         {
             auto state = state_.get();
-            term = state->current_term_;
-            if (state->latest_heartbeat_ + options_.election_timeout > std::chrono::system_clock::now()) {
-                return;
+            if (state->role_ == kFollower) {
+                ClientResponse response;
+                response.set_success(false);
+                assert(state->leader_id_);
+                response.set_retry_to(*state->leader_id_);
+                return bus::make_future(std::move(response));
             }
-        }
-        std::this_thread::sleep_for(options_.election_timeout * (double(rand()) / double(RAND_MAX)));
-        {
-            auto state = state_.get();
-            if (term == state->current_term_) {
-                VoteRpc rpc;
-                for (auto [id, endpoint] : endpoint_to_id_) {
-                    if (id != state->id_) {
-                        send<kVote, Response>(rpc, endpoint, k);
+            if (state->role_ == kCandidate) {
+                ClientResponse response;
+                response.set_success(false);
+                return bus::make_future(std::move(response));
+            }
+            if (state->role_ == kLeader) {
+                LogRecord rec;
+                ClientResponse response;
+                for (auto op : req.operations()) {
+                    if (op.type() == ClientRequest::Operation::READ) {
+                        auto entry = response.add_entries();
+                        entry->set_key(op.key());
+                        entry->set_value(state->fsm_[op.key()]);
+                    }
+                    if (op.type() == ClientRequest::Operation::WRITE) {
+                        auto applied = rec.add_operations();
+                        applied->set_key(op.key());
+                        applied->set_value(op.value());
                     }
                 }
             }
         }
     }
 
-    bus::Future<Response> handle_append_rpcs(AppendRpcs msg) {
+    void initiate_elections() {
+        size_t term;
+        {
+            auto state = state_.get();
+            if (state->role_ != kCandidate) {
+                term = ++state->current_term_;
+                state->voted_for_me_.clear();
+                state->role_ = kCandidate;
+                if (state->latest_heartbeat_ + options_.election_timeout > std::chrono::system_clock::now()) {
+                    return;
+                }
+            }
+        }
+        std::this_thread::sleep_for(options_.election_timeout * (double(rand()) / double(RAND_MAX)));
+        std::vector<bus::Future<bus::ErrorT<Response>>> responses;
+        std::vector<size_t> ids;
+        {
+            auto state = state_.get();
+            if (term == state->current_term_) {
+                VoteRpc rpc;
+                for (size_t id = 0; id < options_.members; ++id) {
+                    if (id != id_) {
+                        responses.push_back(send<VoteRpc, Response>(rpc, id, kVote, options_.heartbeat_timeout));
+                        ids.push_back(id);
+
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < responses.size(); ++i) {
+            responses[i]
+                .subscribe([&, id=ids[i]] (bus::ErrorT<Response>& r) {
+                        if (r && r.unwrap().success()) {
+                            auto state = state_.get();
+                            state->voted_for_me_.insert(id);
+                            if (state->voted_for_me_.size() > options_.members / 2) {
+                                state->role_ = kLeader;
+                            }
+                        }
+                    });
+        }
+    }
+
+    bus::Future<Response> handle_append_rpcs(int id, AppendRpcs msg) {
         bus::Future<bool> flush_event;
         {
             auto state = state_.get();
@@ -203,6 +266,7 @@ private:
                 if (msg.term() > state->current_term_) {
                     state->current_term_ = msg.term();
                     state->role_ = kFollower;
+                    state->leader_id_ = id;
                 } else {
                     assert(msg.term() != state->current_term_);
                     return bus::make_future(state->create_response(false));
@@ -212,6 +276,7 @@ private:
                 return bus::make_future(state->create_response(false));
             }
             if (state->role_ == kFollower) {
+                state->leader_id_ = id;
                 for (auto& rpc : msg.records()) {
                     if (rpc.ts() == state->next_ts_) {
                         state->buffered_log_.push_back(rpc);
@@ -236,10 +301,10 @@ private:
             }
 
             for (auto [id, next_ts] : state->next_timestamps_) {
-                endpoints.push_back(id_to_endpoint_[id_to_endpoint_[id]]);
+                endpoints.push_back(id);
                 AppendRpcs rpcs;
                 rpcs.set_term(state->current_term_);
-                rpcs.set_master_id(state->id_);
+                rpcs.set_master_id(id_);
                 if (state->buffered_log_.size() > 0) {
                     const size_t start_ts = state->buffered_log_[0].ts();
                     const size_t start_index = next_ts - start_ts;
@@ -252,7 +317,7 @@ private:
         }
         for (size_t i = 0; i < endpoints.size(); ++i) {
             send<AppendRpcs, Response>(std::move(messages[i]), endpoints[i], kAppendRpcs, options_.heartbeat_timeout)
-                .subscribe([this, id=endpoint_to_id_[endpoints[i]]] (bus::ErrorT<Response>& result) {
+                .subscribe([this, id=endpoints[i]] (bus::ErrorT<Response>& result) {
                         if (result) {
                             auto& response = result.unwrap();
                             auto state = state_.get();
@@ -261,7 +326,7 @@ private:
                                 state->commited_timestamps_[id] = response.durable_ts();
                                 std::vector<uint64_t> tss;
                                 for (auto [id, ts] : state->commited_timestamps_) {
-                                    if (id != state->id_) {
+                                    if (id != id_) {
                                         tss.push_back(ts);
                                     }
                                 }
@@ -456,6 +521,8 @@ private:
             FATAL(child < 0);
             State& state = unsafe_state_ptr;
             write_uint64(fd, state.fsm_.size());
+    std::unordered_map<int, int> endpoint_to_id_;
+    std::unordered_map<int, int> id_to_endpoint_;
             write_uint64(fd, state.applied_ts_);
             uint64_t applied_ts = state.applied_ts_;
             for (auto [k, v] : state.fsm_) {
@@ -482,8 +549,8 @@ private:
 
     bus::internal::ExclusiveWrapper<int> log_fd_{kInvalidFd};
 
-    std::unordered_map<int, int> endpoint_to_id_;
-    std::unordered_map<int, int> id_to_endpoint_;
+    uint64_t id_;
+
     bus::internal::Event shot_down_;
 };
 
@@ -506,16 +573,16 @@ int main(int argc, char** argv) {
 
     bus::EndpointManager manager;
     auto members = conf["members"];
-    std::unordered_map<int, int> endpoint_to_id;
     for (size_t i = 0; i < members.size(); ++i) {
         auto member = members[Json::ArrayIndex(i)];
-        endpoint_to_id[manager.register_endpoint(member["host"].asString(), member["port"].asInt())] = member["id"].asInt();
+        manager.merge_to_endpoint(member["host"].asString(), member["port"].asInt(), i);
     }
 
     RaftNode::Options options;
     options.heartbeat_timeout = parse_duration(conf["heartbeat_timeout"]);
     options.heartbeat_interval = parse_duration(conf["heartbeat_interval"]);
     options.election_timeout = parse_duration(conf["election_timeout"]);
+    options.members = members.size();
 
     RaftNode node(opts, manager, options);
     node.shot_down().wait();

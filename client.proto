@@ -12,3 +12,14 @@ message ClientRequest {
     };
     repeated Operation operations = 1;
 };
+
+message ClientResponse {
+    bool success = 1;
+    uint64 retry_to = 2;
+
+    message Entry {
+        bytes key = 1;
+        bytes value = 2;
+    }
+    repeated Entry entries = 3;
+}
