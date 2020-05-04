@@ -73,8 +73,9 @@ private:
         std::unordered_map<uint64_t, uint64_t> next_timestamps_;
         std::unordered_map<uint64_t, uint64_t> commited_timestamps_;
 
-        std::unordered_map<uint64_t, bus::Promise<ClientResponse>> client_requests_;
+        std::unordered_map<uint64_t, bus::Promise<bool>> flush_subscribers_;
 
+        size_t flushed_index_ = 0;
         std::vector<LogRecord> buffered_log_;
         bus::Promise<bool> flush_event_;
 
@@ -124,6 +125,7 @@ public:
         std::filesystem::path dir;
 
         size_t members;
+        size_t applied_backlog;
     };
 
     RaftNode(bus::ProtoBus::Options opts, bus::EndpointManager& manager, Options options)
@@ -188,6 +190,7 @@ private:
                 response.set_success(false);
                 assert(state->leader_id_);
                 response.set_retry_to(*state->leader_id_);
+                response.set_should_retry(true);
                 return bus::make_future(std::move(response));
             }
             if (state->role_ == kCandidate) {
@@ -210,8 +213,14 @@ private:
                         applied->set_value(op.value());
                     }
                 }
+                rec.set_ts(state->next_ts_++);
+                auto promise = bus::Promise<bool>();
+                state->flush_subscribers_.insert({ rec.ts(), promise });
+                state->buffered_log_.push_back(std::move(rec));
+                return promise.future().map([response=std::move(response)](bool) { return response; });
             }
         }
+        FATAL(true);
     }
 
     void initiate_elections() {
@@ -318,6 +327,7 @@ private:
         for (size_t i = 0; i < endpoints.size(); ++i) {
             send<AppendRpcs, Response>(std::move(messages[i]), endpoints[i], kAppendRpcs, options_.heartbeat_timeout)
                 .subscribe([this, id=endpoints[i]] (bus::ErrorT<Response>& result) {
+                        std::vector<bus::Promise<bool>> subscribers;
                         if (result) {
                             auto& response = result.unwrap();
                             auto state = state_.get();
@@ -331,13 +341,21 @@ private:
                                     }
                                 }
                                 std::sort(tss.begin(), tss.end());
-                                state->advance_to(tss[tss.size() / 2 - 1]);
+                                auto ts = tss[tss.size() / 2 - 1];
+                                state->advance_to(ts);
+                                while (!state->flush_subscribers_.empty() && state->flush_subscribers_.begin()->first <= ts) {
+                                    subscribers.push_back(state->flush_subscribers_.begin()->second);
+                                    state->flush_subscribers_.erase(state->flush_subscribers_.begin());
+                                }
                             } else {
                                 if (response.term() > state->current_term_) {
                                     state->role_ = kFollower;
                                     state->current_term_ = response.term();
                                 }
                             }
+                        }
+                        for (auto& f : subscribers) {
+                            f.set_value(true);
                         }
                     } );
         }
@@ -406,12 +424,23 @@ private:
     }
 
     void flush() {
+        // we want log records to be consecutive
+        std::unique_lock lock_(flusher_mutex_);
+
         std::vector<LogRecord> to_flush;
         bus::Promise<bool> to_deliver;
         auto log = log_fd_.get();
+
         {
             auto state = state_.get();
-            to_flush.swap(state->buffered_log_);
+            auto& log = state->buffered_log_;
+            size_t i = state->flushed_index_;
+            while (i < log.size() && log[i].ts() + options_.applied_backlog < state->applied_ts_) {
+                ++i;
+            }
+            to_flush.insert(to_flush.begin(), log.begin() + state->flushed_index_, log.end());
+            log.erase(log.begin(), log.begin() + i);
+            state->flushed_index_ = log.size();
         }
 
         for (auto& record : to_flush) {
@@ -521,8 +550,8 @@ private:
             FATAL(child < 0);
             State& state = unsafe_state_ptr;
             write_uint64(fd, state.fsm_.size());
-    std::unordered_map<int, int> endpoint_to_id_;
-    std::unordered_map<int, int> id_to_endpoint_;
+            std::unordered_map<int, int> endpoint_to_id_;
+            std::unordered_map<int, int> id_to_endpoint_;
             write_uint64(fd, state.applied_ts_);
             uint64_t applied_ts = state.applied_ts_;
             for (auto [k, v] : state.fsm_) {
@@ -538,6 +567,8 @@ private:
     }
 
 private:
+    std::mutex flusher_mutex_;
+
     bus::BufferPool buffer_pool_;
     Options options_;
     bus::internal::ExclusiveWrapper<State> state_;
@@ -582,6 +613,7 @@ int main(int argc, char** argv) {
     options.heartbeat_timeout = parse_duration(conf["heartbeat_timeout"]);
     options.heartbeat_interval = parse_duration(conf["heartbeat_interval"]);
     options.election_timeout = parse_duration(conf["election_timeout"]);
+    options.applied_backlog = conf["applied_backlog"].asUInt64();
     options.members = members.size();
 
     RaftNode node(opts, manager, options);

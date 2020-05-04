@@ -44,3 +44,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONCPP REQUIRED jsoncpp)
 target_include_directories(main PUBLIC ${JSONCPP_INCLUDE_DIRS})
 target_link_libraries(main ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES} bus)
+
+add_executable(client client.cpp ${PROTO_HDRS} ${PROTO_SRCS})
+target_include_directories(client PUBLIC ${JSONCPP_INCLUDE_DIRS})
+target_link_libraries(client ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES} bus)
