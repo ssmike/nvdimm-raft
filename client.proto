@@ -15,6 +15,7 @@ message ClientRequest {
 
 message ClientResponse {
     bool success = 1;
+    bool should_retry = 4;
     uint64 retry_to = 2;
 
     message Entry {
