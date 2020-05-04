@@ -117,6 +117,8 @@ private:
 
 public:
     struct Options {
+        bus::ProtoBus::Options bus_options;
+
         duration heartbeat_timeout;
         duration heartbeat_interval;
         duration election_timeout;
@@ -128,9 +130,9 @@ public:
         size_t applied_backlog;
     };
 
-    RaftNode(bus::ProtoBus::Options opts, bus::EndpointManager& manager, Options options)
-        : bus::ProtoBus(opts, manager)
-        , buffer_pool_(opts.tcp_opts.max_message_size)
+    RaftNode(bus::EndpointManager& manager, Options options)
+        : bus::ProtoBus(options.bus_options, manager)
+        , buffer_pool_(options.bus_options.tcp_opts.max_message_size)
         , options_(options)
         , elector_([this] { initiate_elections(); }, options.election_timeout)
         , rotator_([this] { rotate(); }, options.rotate_interval)
@@ -139,8 +141,8 @@ public:
     {
         {
             auto state = state_.get();
-            assert(opts.greeter.has_value());
-            id_ = *opts.greeter;
+            assert(options.bus_options.greeter.has_value());
+            id_ = *options.bus_options.greeter;
             for (size_t id = 0; id < options_.members; ++id) {
                 if (id != id_) {
                     state->next_timestamps_[id] = 0;
@@ -594,13 +596,14 @@ int main(int argc, char** argv) {
     assert(argc == 2);
     Json::Value conf;
     std::ifstream(argv[1]) >> conf;
-    bus::ProtoBus::Options opts;
-    opts.batch_opts.max_batch = conf["max_batch"].asInt();
-    opts.batch_opts.max_delay = parse_duration(conf["max_delay"]);
-    opts.greeter = conf["id"].asInt();
-    opts.tcp_opts.port = conf["port"].asInt();
-    opts.tcp_opts.fixed_pool_size = conf["pool_size"].asUInt64();
-    opts.tcp_opts.max_message_size = conf["max_message"].asUInt64();
+    RaftNode::Options options;
+    options.bus_options.batch_opts.max_batch = conf["max_batch"].asInt();
+    options.bus_options.batch_opts.max_delay = parse_duration(conf["max_delay"]);
+    options.bus_options.greeter = conf["id"].asInt();
+    options.bus_options.tcp_opts.port = conf["port"].asInt();
+    options.bus_options.tcp_opts.fixed_pool_size = conf["pool_size"].asUInt64();
+    options.bus_options.tcp_opts.max_message_size = conf["max_message"].asUInt64();
+    options.dir = conf["log"].asString();
 
     bus::EndpointManager manager;
     auto members = conf["members"];
@@ -609,13 +612,12 @@ int main(int argc, char** argv) {
         manager.merge_to_endpoint(member["host"].asString(), member["port"].asInt(), i);
     }
 
-    RaftNode::Options options;
     options.heartbeat_timeout = parse_duration(conf["heartbeat_timeout"]);
     options.heartbeat_interval = parse_duration(conf["heartbeat_interval"]);
     options.election_timeout = parse_duration(conf["election_timeout"]);
     options.applied_backlog = conf["applied_backlog"].asUInt64();
     options.members = members.size();
 
-    RaftNode node(opts, manager, options);
+    RaftNode node(manager, options);
     node.shot_down().wait();
 }

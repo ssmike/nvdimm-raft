@@ -1,0 +1,1 @@
+export QUORUM=3
