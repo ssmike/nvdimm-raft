@@ -25,11 +25,12 @@ confs = {
             {'host': 'localhost', 'port': port(i)}
             for i in nodes
         ],
-        'heartbeat_interval': 0.2,
+        'heartbeat_interval': 0.3,
         'heartbeat_timeout': 0.01,
         'election_timeout': 2,
         'rotate_interval': 200,
         'applied_backlog': 10000,
+        'flush_interval': 0.005,
         'timeout': 2,
         'log': '%d.dir' % (i,)
     }
