@@ -81,8 +81,9 @@ int main(int argc, char** argv) {
 
     Client client(opts, manager, members.size(), parse_duration(conf["timeout"]));
 
-    ClientRequest req;
+
     {
+        ClientRequest req;
         auto* op = req.add_operations();
         op->set_type(ClientRequest::Operation::WRITE);
         op->set_key("key");
@@ -91,6 +92,7 @@ int main(int argc, char** argv) {
     }
 
     {
+        ClientRequest req;
         auto* op = req.add_operations();
         op->set_type(ClientRequest::Operation::READ);
         op->set_key("key");

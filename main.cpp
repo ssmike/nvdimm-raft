@@ -128,7 +128,7 @@ private:
         std::vector<int64_t> next_timestamps_;
         std::vector<int64_t> durable_timestamps_;
 
-        std::unordered_map<uint64_t, bus::Promise<bool>> commit_subscribers_;
+        std::unordered_map<int64_t, bus::Promise<bool>> commit_subscribers_;
 
         size_t flushed_index_ = 0;
         std::vector<LogRecord> buffered_log_;
@@ -158,21 +158,32 @@ private:
             }
         }
 
-        void advance_to(uint64_t ts) {
+        void advance_to(int64_t ts) {
             if (!buffered_log_.empty()) {
-                if (applied_ts_ < ts) {
-                    spdlog::debug("advance from {1:d} to {0:d}", ts, applied_ts_);
-                }
+                auto old_ts = applied_ts_;
                 ssize_t pos = applied_ts_ - ssize_t(buffered_log_[0].ts()) + 1;
                 if (pos >= 0) {
-                    spdlog::debug("advance from {1:d} to {0:d} start pos {2:d}", ts, applied_ts_, pos);
                     for (; pos < buffered_log_.size() && ts >= buffered_log_[pos].ts(); ++pos) {
                         apply(buffered_log_[pos]);
                         applied_ts_ = buffered_log_[pos].ts();
                     }
                 }
+                if (old_ts < applied_ts_) {
+                    spdlog::debug("advance from {0:d} to {1:d}", old_ts, applied_ts_);
+                }
             }
         }
+
+        void advance_applied_timestmap() {
+            std::vector<int64_t> tss;
+            for (auto ts : durable_timestamps_) {
+                tss.push_back(ts);
+            }
+            std::sort(tss.begin(), tss.end());
+            auto ts = tss[tss.size() / 2];
+            advance_to(ts);
+        }
+
     };
 
 public:
@@ -187,7 +198,7 @@ public:
         std::filesystem::path dir;
 
         size_t members;
-        size_t applied_backlog;
+        ssize_t applied_backlog;
     };
 
     RaftNode(bus::EndpointManager& manager, Options options)
@@ -206,6 +217,7 @@ public:
             id_ = *options.bus_options.greeter;
             state->next_timestamps_.assign(options_.members, 0);
             state->durable_timestamps_.assign(options_.members, -1);
+            state->follower_heartbeats_.assign(options_.members, std::chrono::system_clock::time_point::min());
         }
         recover();
         rotator_.delayed_start();
@@ -231,11 +243,12 @@ private:
         } else if (state->current_term_ < rpc.term()) {
             state->role_ = kCandidate;
             state->current_term_ = rpc.term();
+            state->voted_for_me_.clear();
             elector_.trigger();
         }
 
         if (state->durable_ts_ > rpc.ts() || (state->leader_id_ && rpc.vote_for() != *state->leader_id_)) {
-            spdlog::info("denied vote for {0:d} their ts={1:d} my ts={2:d}", rpc.vote_for(), rpc.ts(), state->durable_ts_);
+            spdlog::info("denied vote for {0:d} their ts={1:d} my ts={2:d} my vote {3:d}", rpc.vote_for(), rpc.ts(), state->durable_ts_, *state->leader_id_);
             return state->create_response(false);
         } else {
             vote_keeper_.get()->store(rpc);
@@ -245,7 +258,7 @@ private:
         }
     }
 
-    bus::Future<ClientResponse> handle_client_request(int, ClientRequest req) {
+    bus::Future<ClientResponse> handle_client_request(int id, ClientRequest req) {
         {
             auto state = state_.get();
             if (state->role_ == kFollower) {
@@ -265,6 +278,8 @@ private:
             if (state->role_ == kLeader) {
                 LogRecord rec;
                 ClientResponse response;
+                bool rd_only = true;
+                response.set_success(true);
                 for (auto op : req.operations()) {
                     if (op.type() == ClientRequest::Operation::READ) {
                         auto entry = response.add_entries();
@@ -275,7 +290,12 @@ private:
                         auto applied = rec.add_operations();
                         applied->set_key(op.key());
                         applied->set_value(op.value());
+                        rd_only = false;
                     }
+                }
+                if (rd_only) {
+                    spdlog::debug("read only request serving immediately");
+                    return bus::make_future(std::move(response));
                 }
                 rec.set_ts(state->next_ts_++);
                 spdlog::debug("handling client request ts={0:d}", rec.ts());
@@ -300,11 +320,11 @@ private:
                     if (id != id_) {
                         times.push_back(state->follower_heartbeats_[id]);
                     }
-                    std::sort(times.begin(), times.end());
-                    latest_heartbeat = times[options_.members / 2];
                 }
+                std::sort(times.begin(), times.end());
+                latest_heartbeat = times[options_.members / 2];
             }
-            if (state->latest_heartbeat_ + options_.election_timeout > now) {
+            if (latest_heartbeat + options_.election_timeout > now) {
                 return;
             }
             spdlog::info("starting elections");
@@ -314,7 +334,7 @@ private:
             state->leader_id_ = std::nullopt;
             state->latest_heartbeat_ = now;
         }
-        std::this_thread::sleep_for(options_.election_timeout * (double(rand()) / double(RAND_MAX)));
+        std::this_thread::sleep_for((options_.election_timeout * id_) / options_.members);
         std::vector<bus::Future<bus::ErrorT<Response>>> responses;
         std::vector<size_t> ids;
         {
@@ -324,6 +344,12 @@ private:
                     return;
                 } else {
                     state->leader_id_ = id_;
+                    VoteRpc self_vote;
+                    self_vote.set_ts(state->durable_ts_);
+                    self_vote.set_term(state->current_term_);
+                    self_vote.set_vote_for(id_);
+                    vote_keeper_.get()->store(self_vote);
+                    state->voted_for_me_.insert(id_);
                 }
                 VoteRpc rpc;
                 rpc.set_term(state->current_term_);
@@ -345,13 +371,14 @@ private:
                             auto state = state_.get();
                             state->next_timestamps_[id] = response.next_ts();
                             state->durable_timestamps_[id] = response.durable_ts();
+                            state->follower_heartbeats_[id] = std::chrono::system_clock::now();
                             if (state->current_term_ == term) {
                                 spdlog::info("granted vote from {0:d}", id);
                                 state->voted_for_me_.insert(id);
                                 if (state->voted_for_me_.size() > options_.members / 2) {
                                     spdlog::info("becoming leader", id);
                                     state->role_ = kLeader;
-                                    advance_applied_timestmap(state);
+                                    state->advance_applied_timestmap();
                                     state->durable_timestamps_.assign(options_.members, state->applied_ts_);
                                     state->next_timestamps_.assign(options_.members, state->applied_ts_ + 1);
                                 }
@@ -401,16 +428,6 @@ private:
         return flush_event.map([this](bool) { return state_.get()->create_response(true); });
     }
 
-    void advance_applied_timestmap(bus::internal::ExclusiveGuard<State>& state) {
-        std::vector<uint64_t> tss;
-        for (size_t id = 0; id < options_.members; ++id) {
-            tss.push_back(state->durable_timestamps_[id]);
-        }
-        std::sort(tss.begin(), tss.end());
-        auto ts = tss[tss.size() / 2];
-        state->advance_to(ts);
-    }
-
     void heartbeat_to_followers() {
         std::vector<uint64_t> endpoints;
         std::vector<AppendRpcs> messages;
@@ -453,11 +470,13 @@ private:
                             if (response.success()) {
                                 state->next_timestamps_[id] = response.next_ts();
                                 state->durable_timestamps_[id] = response.durable_ts();
+                                state->follower_heartbeats_[id] = std::chrono::system_clock::now();
                                 if (to_log) {
                                     spdlog::debug("node {2:d} responded with next_ts={0:d} durable_ts={1:d}", response.next_ts(), response.durable_ts(), id);
                                 }
-                                advance_applied_timestmap(state);
+                                state->advance_applied_timestmap();
                                 while (!state->commit_subscribers_.empty() && state->commit_subscribers_.begin()->first <= state->applied_ts_) {
+                                    spdlog::debug("fire commit subscriber for ts={0:d}", state->commit_subscribers_.begin()->first);
                                     subscribers.push_back(state->commit_subscribers_.begin()->second);
                                     state->commit_subscribers_.erase(state->commit_subscribers_.begin());
                                 }
@@ -552,6 +571,7 @@ private:
             auto& log = state->buffered_log_;
             size_t i = 0;
             while (i < log.size() && log[i].ts() + options_.applied_backlog < state->applied_ts_) {
+                spdlog::debug("deleting old record with ts={0:d} applied_ts={1:d}", log[i].ts(), state->applied_ts_);
                 ++i;
             }
             to_flush.insert(to_flush.begin(), log.begin() + state->flushed_index_, log.end());
@@ -561,7 +581,7 @@ private:
             }
             state->flushed_index_ = log.size();
             to_deliver.swap(state->flush_event_);
-            durable_ts = state->buffered_log_.size();
+            durable_ts = !state->buffered_log_.empty() ? state->buffered_log_.back().ts() : state->durable_ts_;
         }
 
         for (auto& record : to_flush) {
@@ -656,8 +676,8 @@ private:
         size_t phase;
         // sync calls under lock cos don't want to deal with partial states
         {
-            auto state = state_.get();
             auto log_fd = log_fd_.get();
+            auto state = state_.get();
             if (*log_fd != kInvalidFd) {
                 close(*log_fd);
                 to_delete = changelog_name(state->current_changelog_);
