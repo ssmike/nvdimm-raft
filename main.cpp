@@ -192,7 +192,7 @@ public:
 
     RaftNode(bus::EndpointManager& manager, Options options)
         : bus::ProtoBus(options.bus_options, manager)
-        , keeper_(options.dir / "vote")
+        , vote_keeper_(options.dir / "vote")
         , buffer_pool_(options.bus_options.tcp_opts.max_message_size)
         , options_(options)
         , elector_([this] { initiate_elections(); }, options.election_timeout)
