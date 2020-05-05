@@ -4,6 +4,8 @@
 
 #include "proto_bus.h"
 
+//#include <spdlog/spdlog.h>
+
 #include <json/reader.h>
 #include <fstream>
 
@@ -29,7 +31,7 @@ public:
     bus::Future<ClientResponse> execute(ClientRequest req) {
         return bound_execute(req, leader_.load())
             .chain([&] (ClientResponse& resp) {
-                    if (!resp.success()) {
+                    if (resp.should_retry()) {
                         leader_.store(resp.retry_to());
                         return bound_execute(req, resp.retry_to());
                     } else {

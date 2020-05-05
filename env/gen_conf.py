@@ -11,33 +11,40 @@ def port(i):
     return 9000 + i
 
 
-confs = [
-    {
+nodes = range(quorum)
+
+confs = {
+    '%d.json' % (i,): {
         'max_batch': 1,
-        'max_delay': 0,
+        'max_delay': 5,
         'id': i,
         'port': port(i),
         'pool_size': 3,
         'max_message': 8192,
         'members': [
             {'host': 'localhost', 'port': port(i)}
-            for i in range(quorum)
+            for i in nodes
         ],
         'heartbeat_interval': 0.2,
         'heartbeat_timeout': 0.01,
-        'election_timeout': 0.8,
+        'election_timeout': 2,
+        'rotate_interval': 200,
         'applied_backlog': 10000,
+        'timeout': 2,
         'log': '%d.dir' % (i,)
     }
-    for i in range(quorum)
-]
+    for i in nodes
+}
 
-for i in range(quorum):
-    with open('%d.json' % (i,), 'w') as fout:
-        json.dump(confs[i], fout, indent=4)
+for fname, conf in confs.items():
+    with open(fname, 'w') as fout:
+        json.dump(conf, fout, indent=4)
 
 
-client_conf = copy(confs[0])
+client_conf = copy(next(iter(confs.values())))
 client_conf['port'] = port(quorum)
+del client_conf['id']
+del client_conf['log']
+
 with open('client.json', 'w') as fout:
     json.dump(client_conf, fout, indent=4)

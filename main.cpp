@@ -14,6 +14,8 @@
 #include <fstream>
 #include <map>
 
+#include <spdlog/spdlog.h>
+
 #include <json/reader.h>
 
 #define FATAL(cond) if (cond) { std::cerr << strerror(errno) << std::endl; std::terminate();}
@@ -104,6 +106,9 @@ private:
 
         void advance_to(uint64_t ts) {
             if (!buffered_log_.empty()) {
+                if (applied_ts_ < ts) {
+                    spdlog::debug("advance to {0:d}", ts);
+                }
                 ssize_t pos = applied_ts_ - buffered_log_[0].ts() + 1;
                 if (pos >= 0) {
                     for (; pos < buffered_log_.size() && ts < buffered_log_[pos].ts(); ++pos) {
@@ -155,7 +160,7 @@ public:
         using namespace std::placeholders;
         register_handler<VoteRpc, Response>(kVote, [&] (int, VoteRpc rpc) { return bus::make_future(vote(rpc)); });
         register_handler<AppendRpcs, Response>(kAppendRpcs, std::bind(&RaftNode::handle_append_rpcs, this, _1, _2));
-        register_handler<ClientRequest, ClientResponse>(kClientReq, std::bind(&RaftNode::HandleClientRequest, this, _1, _2));
+        register_handler<ClientRequest, ClientResponse>(kClientReq, std::bind(&RaftNode::handle_client_request, this, _1, _2));
         sender_.delayed_start();
         elector_.delayed_start();
     }
@@ -166,6 +171,7 @@ public:
 
 private:
     Response vote(VoteRpc rpc) {
+        spdlog::info("received vote request from {0:d} with ts={1:d} term={2:d}", rpc.vote_for(), rpc.ts(), rpc.term());
         auto state = state_.get();
         if (state->current_term_ > rpc.term()) {
             return state->create_response(false);
@@ -173,18 +179,20 @@ private:
             state->role_ = kFollower;
             state->current_term_ = rpc.term();
             state->leader_id_ = rpc.vote_for();
+            spdlog::info("stale term becoming follower", rpc.vote_for());
             return state->create_response(true);
         } else {
-            if (state->applied_ts_ >= rpc.ts() || (state->leader_id_ && rpc.vote_for() != *state->leader_id_)) {
+            if (state->applied_ts_ > rpc.ts() || (state->leader_id_ && rpc.vote_for() != *state->leader_id_)) {
                 return state->create_response(false);
             } else {
                 state->leader_id_ = rpc.vote_for();
+                spdlog::info("granted vote for {0:d}", rpc.vote_for());
                 return state->create_response(true);
             }
         }
     }
 
-    bus::Future<ClientResponse> HandleClientRequest(int id, ClientRequest req) {
+    bus::Future<ClientResponse> handle_client_request(int, ClientRequest req) {
         {
             auto state = state_.get();
             if (state->role_ == kFollower) {
@@ -193,6 +201,7 @@ private:
                 assert(state->leader_id_);
                 response.set_retry_to(*state->leader_id_);
                 response.set_should_retry(true);
+                spdlog::debug("handling client request redirect to {0:d}", *state->leader_id_);
                 return bus::make_future(std::move(response));
             }
             if (state->role_ == kCandidate) {
@@ -216,6 +225,7 @@ private:
                     }
                 }
                 rec.set_ts(state->next_ts_++);
+                spdlog::debug("handling client request ts={0:d}", rec.ts());
                 auto promise = bus::Promise<bool>();
                 state->flush_subscribers_.insert({ rec.ts(), promise });
                 state->buffered_log_.push_back(std::move(rec));
@@ -229,13 +239,15 @@ private:
         size_t term;
         {
             auto state = state_.get();
-            if (state->role_ != kCandidate) {
-                term = ++state->current_term_;
-                state->voted_for_me_.clear();
-                state->role_ = kCandidate;
+            if (state->role_ == kFollower) {
                 if (state->latest_heartbeat_ + options_.election_timeout > std::chrono::system_clock::now()) {
                     return;
                 }
+                spdlog::info("starting elections");
+                term = ++state->current_term_;
+                state->voted_for_me_.clear();
+                state->role_ = kCandidate;
+                state->leader_id_ = std::nullopt;
             }
         }
         std::this_thread::sleep_for(options_.election_timeout * (double(rand()) / double(RAND_MAX)));
@@ -244,24 +256,35 @@ private:
         {
             auto state = state_.get();
             if (term == state->current_term_) {
+                if (state->leader_id_ && *state->leader_id_ != id_) {
+                    return;
+                } else {
+                    state->leader_id_ = id_;
+                }
                 VoteRpc rpc;
+                rpc.set_term(state->current_term_);
+                rpc.set_ts(state->durable_ts_);
+                rpc.set_vote_for(id_);
                 for (size_t id = 0; id < options_.members; ++id) {
                     if (id != id_) {
                         responses.push_back(send<VoteRpc, Response>(rpc, id, kVote, options_.heartbeat_timeout));
                         ids.push_back(id);
-
                     }
                 }
             }
         }
         for (size_t i = 0; i < responses.size(); ++i) {
             responses[i]
-                .subscribe([&, id=ids[i]] (bus::ErrorT<Response>& r) {
+                .subscribe([&, id=ids[i], term] (bus::ErrorT<Response>& r) {
                         if (r && r.unwrap().success()) {
                             auto state = state_.get();
-                            state->voted_for_me_.insert(id);
-                            if (state->voted_for_me_.size() > options_.members / 2) {
-                                state->role_ = kLeader;
+                            if (state->current_term_ == term) {
+                                spdlog::info("granted vote from {0:d}", id);
+                                state->voted_for_me_.insert(id);
+                                if (state->voted_for_me_.size() > options_.members / 2) {
+                                    spdlog::info("becoming leader", id);
+                                    state->role_ = kLeader;
+                                }
                             }
                         }
                     });
@@ -272,32 +295,29 @@ private:
         bus::Future<bool> flush_event;
         {
             auto state = state_.get();
-            state->latest_heartbeat_ = std::chrono::system_clock::now();
-            if (state->role_ == kLeader) {
-                if (msg.term() > state->current_term_) {
-                    state->current_term_ = msg.term();
-                    state->role_ = kFollower;
-                    state->leader_id_ = id;
-                } else {
-                    assert(msg.term() != state->current_term_);
-                    return bus::make_future(state->create_response(false));
-                }
+            if (msg.term() > state->current_term_) {
+                spdlog::info("stale term becoming follower");
+                state->current_term_ = msg.term();
+                state->role_ = kFollower;
+                state->leader_id_ = id;
             }
-            if (state->role_ == kCandidate) {
+            if (msg.term() < state->current_term_) {
                 return bus::make_future(state->create_response(false));
             }
-            if (state->role_ == kFollower) {
-                state->leader_id_ = id;
-                for (auto& rpc : msg.records()) {
-                    if (rpc.ts() == state->next_ts_) {
-                        state->buffered_log_.push_back(rpc);
-                        ++state->next_ts_;
-                    }
+            assert(state->role_ != kLeader);
+            state->role_ = kFollower;
+            state->latest_heartbeat_ = std::chrono::system_clock::now();
+            state->leader_id_ = id;
+            for (auto& rpc : msg.records()) {
+                if (rpc.ts() == state->next_ts_) {
+                    state->buffered_log_.push_back(rpc);
+                    ++state->next_ts_;
                 }
-                flush_event = state->flush_event_.future();
-            } else {
-                assert(false);
             }
+            if (msg.records_size()) {
+                spdlog::debug("handling heartbeat next_ts={0:d}", state->next_ts_);
+            }
+            flush_event = state->flush_event_.future();
         }
         return flush_event.map([this](bool) { return state_.get()->create_response(true); });
     }
@@ -312,6 +332,9 @@ private:
             }
 
             for (auto [id, next_ts] : state->next_timestamps_) {
+                if (id == id_) {
+                    continue;
+                }
                 endpoints.push_back(id);
                 AppendRpcs rpcs;
                 rpcs.set_term(state->current_term_);
@@ -323,12 +346,16 @@ private:
                         *rpcs.add_records() = state->buffered_log_[i];
                     }
                 }
+                if (rpcs.records_size()) {
+                    spdlog::debug("sending to {0:d} {1:d} records", id, rpcs.records_size());
+                }
                 messages.push_back(std::move(rpcs));
             }
         }
         for (size_t i = 0; i < endpoints.size(); ++i) {
+            bool to_log = messages[i].records_size() > 0;
             send<AppendRpcs, Response>(std::move(messages[i]), endpoints[i], kAppendRpcs, options_.heartbeat_timeout)
-                .subscribe([this, id=endpoints[i]] (bus::ErrorT<Response>& result) {
+                .subscribe([=, id=endpoints[i]] (bus::ErrorT<Response>& result) {
                         std::vector<bus::Promise<bool>> subscribers;
                         if (result) {
                             auto& response = result.unwrap();
@@ -336,6 +363,9 @@ private:
                             if (response.success()) {
                                 state->next_timestamps_[id] = response.next_ts();
                                 state->commited_timestamps_[id] = response.durable_ts();
+                                if (to_log) {
+                                    spdlog::debug("node {2:d} responded with next_ts={0:d} durable_ts={1:d}", response.next_ts(), response.durable_ts(), id);
+                                }
                                 std::vector<uint64_t> tss;
                                 for (auto [id, ts] : state->commited_timestamps_) {
                                     if (id != id_) {
@@ -343,13 +373,14 @@ private:
                                     }
                                 }
                                 std::sort(tss.begin(), tss.end());
-                                auto ts = tss[tss.size() / 2 - 1];
+                                auto ts = tss[tss.size() / 2];
                                 state->advance_to(ts);
                                 while (!state->flush_subscribers_.empty() && state->flush_subscribers_.begin()->first <= ts) {
                                     subscribers.push_back(state->flush_subscribers_.begin()->second);
                                     state->flush_subscribers_.erase(state->flush_subscribers_.begin());
                                 }
                             } else {
+                                spdlog::debug("node {0:d} failed heartbeat", id);
                                 if (response.term() > state->current_term_) {
                                     state->role_ = kFollower;
                                     state->current_term_ = response.term();
@@ -369,14 +400,16 @@ private:
     std::string changelog_name(size_t number) {
         std::stringstream ss;
         ss << changelog_fname_prefix << number;
-        auto path = options_.dir;
-        path += ss.str();
+        std::filesystem::path path = options_.dir;
+        path /= ss.str();
         return path.string();
     }
 
     std::string snapshot_name(size_t number) {
         std::stringstream ss;
-        ss << snapshot_fname_prefix << number; auto path = options_.dir; path += ss.str();
+        ss << snapshot_fname_prefix << number;
+        std::filesystem::path path = options_.dir;
+        path /= ss.str();
         return path.string();
     }
 
@@ -426,11 +459,9 @@ private:
     }
 
     void flush() {
-        // we want log records to be consecutive
-        std::unique_lock lock_(flusher_mutex_);
-
         std::vector<LogRecord> to_flush;
         bus::Promise<bool> to_deliver;
+        // we want log records to be consecutive
         auto log = log_fd_.get();
 
         {
@@ -438,11 +469,16 @@ private:
             auto& log = state->buffered_log_;
             size_t i = state->flushed_index_;
             while (i < log.size() && log[i].ts() + options_.applied_backlog < state->applied_ts_) {
+                spdlog::debug("erasing {0:d} + {1:d} < {2:d}", log[i].ts(), options_.applied_backlog, state->applied_ts_);
                 ++i;
             }
             to_flush.insert(to_flush.begin(), log.begin() + state->flushed_index_, log.end());
             log.erase(log.begin(), log.begin() + i);
+            if (i > 0) {
+                spdlog::debug("erased up to {0:d}'th record", i);
+            }
             state->flushed_index_ = log.size();
+            to_deliver.swap(state->flush_event_);
         }
 
         for (auto& record : to_flush) {
@@ -450,7 +486,7 @@ private:
         }
         FATAL(fdatasync(*log) != 0);
 
-        to_deliver.set_value(true);
+        to_deliver.set_value_once(true);
     }
 
     void write_uint64(int fd, uint64_t val) {
@@ -459,7 +495,7 @@ private:
 
     std::optional<uint64_t> read_uint64(int fd) {
         uint64_t val;
-        if (read(fd, &val, sizeof(val)) != sizeof(val)) {
+        if (read(fd, &val, sizeof(val)) == sizeof(val)) {
             return val;
         } else {
             return std::nullopt;
@@ -471,13 +507,17 @@ private:
         std::vector<size_t> snapshots;
         std::vector<size_t> changelogs;
         for (auto entry : std::filesystem::directory_iterator(options_.dir)) {
-            if (auto number = parse_changelog_name(entry.path())) {
+            if (auto number = parse_changelog_name(entry.path().filename())) {
                 changelogs.push_back(*number);
+                state->current_changelog_ = std::max<size_t>(state->current_changelog_, *number + 1);
             }
-            if (auto number = parse_snapshot_name(entry.path())) {
+            if (auto number = parse_snapshot_name(entry.path().filename())) {
                 snapshots.push_back(*number);
+                state->current_changelog_ = std::max<size_t>(state->current_changelog_, *number + 1);
             }
         }
+        std::sort(snapshots.begin(), snapshots.end());
+        std::sort(changelogs.begin(), changelogs.end());
         while (!snapshots.empty()) {
             auto fname = snapshot_name(snapshots.back());
             DescriptorHolder fd(open(fname.c_str(), O_RDONLY));
@@ -500,12 +540,15 @@ private:
                 fsm.swap(state->fsm_);
                 state->durable_ts_ = state->applied_ts_ = *applied;
                 state->next_ts_ = *applied + 1;
+                break;
+            } else {
+                snapshots.pop_back();
             }
         }
         size_t first_changelog = snapshots.empty() ? 0 : snapshots.back();
         for (auto changelog : changelogs) {
             if (changelog > first_changelog) {
-                auto fname = snapshot_name(changelog);
+                auto fname = changelog_name(changelog);
                 DescriptorHolder fd(open(fname.c_str(), O_RDONLY));
                 while (auto rec = read_log_record(*fd)) {
                     if (rec->ts() == state->next_ts_) {
@@ -516,6 +559,11 @@ private:
                     }
                 }
             }
+        }
+        {
+            auto log_fd = log_fd_.get();
+            *log_fd = open(changelog_name(state->current_changelog_).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
+            FATAL(*log_fd < 0);
         }
     }
 
@@ -531,7 +579,7 @@ private:
                 close(*log_fd);
                 to_delete = changelog_name(state->current_changelog_);
             }
-            *log_fd = open(changelog_name(++state->current_changelog_).c_str(), O_CREAT | O_WRONLY | O_APPEND);
+            *log_fd = open(changelog_name(++state->current_changelog_).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
             phase = ++state->latest_snapshot;
             FATAL(*log_fd < 0);
         }
@@ -539,7 +587,7 @@ private:
             FATAL(unlink(to_delete->c_str()) != 0);
         }
         // here we go dumpin'
-        int fd = open(snapshot_name(phase).c_str(), O_CREAT | O_WRONLY);
+        int fd = open(snapshot_name(phase).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
         FATAL(fd < 0);
         State& unsafe_state_ptr = *state_.get();
         if (pid_t child = fork()) {
@@ -569,8 +617,6 @@ private:
     }
 
 private:
-    std::mutex flusher_mutex_;
-
     bus::BufferPool buffer_pool_;
     Options options_;
     bus::internal::ExclusiveWrapper<State> state_;
@@ -599,7 +645,8 @@ int main(int argc, char** argv) {
     RaftNode::Options options;
     options.bus_options.batch_opts.max_batch = conf["max_batch"].asInt();
     options.bus_options.batch_opts.max_delay = parse_duration(conf["max_delay"]);
-    options.bus_options.greeter = conf["id"].asInt();
+    size_t id = conf["id"].asInt();
+    options.bus_options.greeter = id;
     options.bus_options.tcp_opts.port = conf["port"].asInt();
     options.bus_options.tcp_opts.fixed_pool_size = conf["pool_size"].asUInt64();
     options.bus_options.tcp_opts.max_message_size = conf["max_message"].asUInt64();
@@ -616,7 +663,16 @@ int main(int argc, char** argv) {
     options.heartbeat_interval = parse_duration(conf["heartbeat_interval"]);
     options.election_timeout = parse_duration(conf["election_timeout"]);
     options.applied_backlog = conf["applied_backlog"].asUInt64();
+    options.rotate_interval = parse_duration(conf["rotate_interval"]);
     options.members = members.size();
+
+    spdlog::set_pattern("[%H:%M:%S.%e] [" + std::to_string(id) + "] [%^%l%$] %v");
+
+#ifndef NDEBUG
+    spdlog::set_level(spdlog::level::debug);
+#endif
+
+    spdlog::info("starting node");
 
     RaftNode node(manager, options);
     node.shot_down().wait();
