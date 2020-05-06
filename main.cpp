@@ -116,6 +116,8 @@ private:
 
 private:
     struct State {
+        uint64_t id_;
+
         size_t current_term_ = 0;
         NodeRole role_ = kCandidate;
 
@@ -174,6 +176,7 @@ private:
         }
 
         void advance_applied_timestmap() {
+            durable_timestamps_[id_] = durable_ts_;
             std::vector<int64_t> tss;
             for (auto ts : durable_timestamps_) {
                 tss.push_back(ts);
@@ -375,12 +378,12 @@ private:
                             state->durable_timestamps_[id] = response.durable_ts();
                             state->follower_heartbeats_[id] = std::chrono::system_clock::now();
                             if (state->current_term_ == term) {
-                                spdlog::info("granted vote from {0:d}", id);
+                                spdlog::info("granted vote from {0:d} with durable_ts={1:d}", id, response.durable_ts());
                                 state->voted_for_me_.insert(id);
                                 if (state->voted_for_me_.size() > options_.members / 2) {
-                                    spdlog::info("becoming leader", id);
                                     state->role_ = kLeader;
                                     state->advance_applied_timestmap();
+                                    spdlog::info("becoming leader applied up to {0:d}", state->applied_ts_);
                                     state->durable_timestamps_.assign(options_.members, state->applied_ts_);
                                     state->next_timestamps_.assign(options_.members, state->applied_ts_ + 1);
                                 }
@@ -651,10 +654,12 @@ private:
             DescriptorHolder fd(open(fname.c_str(), O_RDONLY));
             if (!read_uint64(*fd)) continue;
             while (auto rec = read_log_record(*fd)) {
-                state->buffered_log_.resize(std::max<size_t>(state->buffered_log_.size(), rec->ts() + 1 - state->applied_ts_));
-                state->buffered_log_[rec->ts() - state->applied_ts_] = *rec;
-                state->next_ts_ = std::max<size_t>(state->next_ts_, rec->ts() + 1);
-                state->durable_ts_ = std::max<ssize_t>(state->durable_ts_, rec->ts());
+                if (rec->ts() > state->applied_ts_) {
+                    state->buffered_log_.resize(std::max<size_t>(state->buffered_log_.size(), rec->ts() - state->applied_ts_));
+                    state->buffered_log_[rec->ts() - state->applied_ts_ - 1] = *rec;
+                    state->next_ts_ = std::max<size_t>(state->next_ts_, rec->ts() + 1);
+                    state->durable_ts_ = std::max<ssize_t>(state->durable_ts_, rec->ts());
+                }
             }
         }
         {
