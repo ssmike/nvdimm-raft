@@ -5,6 +5,8 @@
 #include "error.h"
 #include "client.pb.h"
 
+#include <google/protobuf/arena.h>
+
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -693,26 +695,30 @@ private:
         int fd = open(snapshot_name(changelog_number).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
         FATAL(fd < 0);
         State& unsafe_state_ptr = *state_.get();
+        bus::SharedView preallocated_buf(buffer_pool_, options_.bus_options.tcp_opts.max_message_size);
+        bus::SharedView preallocated_arena_buf(buffer_pool_, options_.bus_options.tcp_opts.max_message_size);
         if (pid_t child = fork()) {
+            FATAL(child < 0);
             int wstatus;
             pid_t exited = waitpid(child, &wstatus, 0);
             FATAL(child != exited);
             FATAL(WEXITSTATUS(wstatus) != 0);
             FATAL(close(fd) != 0)
         } else {
-            FATAL(child < 0);
             State& state = unsafe_state_ptr;
             write_uint64(fd, state.fsm_.size());
-            std::unordered_map<int, int> endpoint_to_id_;
-            std::unordered_map<int, int> id_to_endpoint_;
             write_uint64(fd, state.applied_ts_);
             uint64_t applied_ts = state.applied_ts_;
             for (auto [k, v] : state.fsm_) {
-                LogRecord record;
-                auto* op = record.add_operations();
+                google::protobuf::ArenaOptions options;
+                options.initial_block = preallocated_arena_buf.data();
+                options.initial_block_size = preallocated_arena_buf.size();
+                google::protobuf::Arena arena(options);
+                LogRecord* record = google::protobuf::Arena::CreateMessage<LogRecord>(&arena);
+                auto* op = record->add_operations();
                 op->set_key(k);
                 op->set_value(v);
-                write_log_record(fd, record);
+                write_log_record(fd, *record, preallocated_buf.data(), preallocated_buf.size());
             }
             FATAL(fsync(fd) != 0);
             _exit(0);
