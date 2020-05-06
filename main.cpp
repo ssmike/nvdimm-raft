@@ -117,7 +117,7 @@ private:
 private:
     struct State {
         size_t current_term_ = 0;
-        NodeRole role_ = kFollower;
+        NodeRole role_ = kCandidate;
 
         ssize_t durable_ts_ = -1;
         ssize_t applied_ts_ = -1;
@@ -137,7 +137,6 @@ private:
         std::unordered_map<std::string, std::string> fsm_;
 
         size_t current_changelog_ = 0;
-        size_t latest_snapshot = 0;
 
         std::vector<std::chrono::system_clock::time_point> follower_heartbeats_;
         std::chrono::system_clock::time_point latest_heartbeat_;
@@ -259,6 +258,7 @@ private:
     }
 
     bus::Future<ClientResponse> handle_client_request(int id, ClientRequest req) {
+        bus::Future<bool> commit_future;
         {
             auto state = state_.get();
             if (state->role_ == kFollower) {
@@ -278,23 +278,25 @@ private:
             if (state->role_ == kLeader) {
                 LogRecord rec;
                 ClientResponse response;
-                bool rd_only = true;
+                bool has_writes = false;
+                bool has_reads = false;
                 response.set_success(true);
                 for (auto op : req.operations()) {
                     if (op.type() == ClientRequest::Operation::READ) {
                         auto entry = response.add_entries();
                         entry->set_key(op.key());
                         entry->set_value(state->fsm_[op.key()]);
+                        has_reads = true;
                     }
                     if (op.type() == ClientRequest::Operation::WRITE) {
                         auto applied = rec.add_operations();
                         applied->set_key(op.key());
                         applied->set_value(op.value());
-                        rd_only = false;
+                        has_writes = true;
                     }
                 }
-                if (rd_only) {
-                    spdlog::debug("read only request serving immediately");
+                if (has_reads) {
+                    response.set_success(!has_writes);
                     return bus::make_future(std::move(response));
                 }
                 rec.set_ts(state->next_ts_++);
@@ -392,14 +394,12 @@ private:
         bus::Future<bool> flush_event;
         {
             auto state = state_.get();
+            if (msg.term() < state->current_term_) {
+                return bus::make_future(state->create_response(false));
+            }
             if (msg.term() > state->current_term_) {
                 spdlog::info("stale term becoming follower");
                 state->current_term_ = msg.term();
-                state->role_ = kFollower;
-                state->leader_id_ = id;
-            }
-            if (msg.term() < state->current_term_) {
-                return bus::make_future(state->create_response(false));
             }
             assert(state->role_ != kLeader);
             state->role_ = kFollower;
@@ -423,6 +423,7 @@ private:
             if (msg.records_size()) {
                 spdlog::debug("handling heartbeat next_ts={0:d}", state->next_ts_);
             }
+            state->advance_to(std::min(msg.applied_ts(), state->durable_ts_));
             flush_event = state->flush_event_.future();
         }
         return flush_event.map([this](bool) { return state_.get()->create_response(true); });
@@ -445,7 +446,6 @@ private:
                 endpoints.push_back(id);
                 AppendRpcs rpcs;
                 rpcs.set_term(state->current_term_);
-                rpcs.set_master_id(id_);
                 if (state->buffered_log_.size() > 0) {
                     const size_t start_ts = state->buffered_log_[0].ts();
                     const size_t start_index = next_ts - start_ts;
@@ -482,10 +482,6 @@ private:
                                 }
                             } else {
                                 spdlog::debug("node {0:d} failed heartbeat", id);
-                                if (response.term() > state->current_term_) {
-                                    state->role_ = kFollower;
-                                    state->current_term_ = response.term();
-                                }
                             }
                         }
                         for (auto& f : subscribers) {
@@ -537,10 +533,10 @@ private:
     }
 
     std::optional<LogRecord> read_log_record(int fd) {
-        uint64_t header;
-        if (read(fd, &header, sizeof(header)) != sizeof(header)) { return std::nullopt; }
+        auto header = read_uint64(fd);
+        if (!header) { return std::nullopt; }
         LogRecord record;
-        bus::SharedView v(buffer_pool_, header);
+        bus::SharedView v(buffer_pool_, *header);
         if (read(fd, v.data(), v.size()) != v.size()) { return std::nullopt; }
         if (!record.ParseFromArray(v.data(), v.size())) { return std::nullopt; }
         return record;
@@ -549,6 +545,7 @@ private:
     bool write_log_record(int fd, const LogRecord& record, char* buf, size_t bufsz) {
         if (record.ByteSizeLong() > bufsz) { return false; }
         bufsz = record.ByteSizeLong();
+        write_uint64(fd, bufsz);
         if (!record.SerializeToArray(buf, bufsz)) { return false; }
         return (write(fd, buf, bufsz) == bufsz);
     }
@@ -585,6 +582,7 @@ private:
         }
 
         for (auto& record : to_flush) {
+            spdlog::debug("write ts={0:d} to changelog", record.ts());
             write_log_record(*log, record);
         }
         FATAL(fdatasync(*log) != 0);
@@ -663,35 +661,31 @@ private:
             auto log_fd = log_fd_.get();
             *log_fd = open(changelog_name(state->current_changelog_).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
             FATAL(*log_fd < 0);
+            write_uint64(*log_fd, state->durable_ts_);
         }
         if (auto vote = vote_keeper_.get()->recover()) {
             state->current_term_ = vote->term();
             state->leader_id_ = vote->vote_for();
         }
+        spdlog::info("recovered term={0:d} durable_ts={1:d} applied_ts={2:d}", state->current_term_, state->durable_ts_, state->applied_ts_);
     }
 
     void rotate() {
-        std::string latest_snapshot;
-        std::optional<std::string> to_delete;
-        size_t phase;
+        size_t changelog_number;
         // sync calls under lock cos don't want to deal with partial states
         {
             auto log_fd = log_fd_.get();
             auto state = state_.get();
             if (*log_fd != kInvalidFd) {
                 close(*log_fd);
-                to_delete = changelog_name(state->current_changelog_);
             }
-            *log_fd = open(changelog_name(++state->current_changelog_).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
-            phase = ++state->latest_snapshot;
+            changelog_number = ++state->current_changelog_;
+            *log_fd = open(changelog_name(changelog_number).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
             FATAL(*log_fd < 0);
             write_uint64(*log_fd, state->durable_ts_);
         }
-        if (to_delete) {
-            FATAL(unlink(to_delete->c_str()) != 0);
-        }
         // here we go dumpin'
-        int fd = open(snapshot_name(phase).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
+        int fd = open(snapshot_name(changelog_number).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
         FATAL(fd < 0);
         State& unsafe_state_ptr = *state_.get();
         if (pid_t child = fork()) {

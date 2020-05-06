@@ -12,7 +12,6 @@ message VoteRpc {
 }
 
 message LogRecord {
-    int64 term = 1;
     int64 ts = 2;
     repeated Operation operations = 3;
 }
@@ -20,7 +19,6 @@ message LogRecord {
 message AppendRpcs {
     repeated LogRecord records = 1;
     int64 term = 2;
-    uint64 master_id = 3;
     int64 applied_ts = 4;
 }
 

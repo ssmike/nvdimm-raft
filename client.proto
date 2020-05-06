@@ -1,5 +1,6 @@
 syntax = "proto3";
 
+// mixed reads & writes are not supported
 message ClientRequest {
     message Operation {
         enum Type {
