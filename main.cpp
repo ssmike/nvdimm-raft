@@ -421,6 +421,7 @@ private:
                 auto promise = bus::Promise<bool>();
                 state->commit_subscribers_.insert({ rec.ts(), promise });
                 state->buffered_log_.push_back(std::move(rec));
+                sender_.trigger();
                 return promise.future().map([response=std::move(response)](bool) { return response; });
             }
         }
@@ -509,6 +510,7 @@ private:
 
     bus::Future<Response> handle_append_rpcs(int id, AppendRpcs msg) {
         bus::Future<bool> flush_event;
+        bool has_new_records = false;
         {
             auto state = state_.get();
             if (msg.term() < state->current_term_) {
@@ -522,6 +524,7 @@ private:
             state->role_ = kFollower;
             state->latest_heartbeat_ = std::chrono::system_clock::now();
             state->leader_id_ = id;
+
             for (auto& rpc : msg.records()) {
                 if (rpc.ts() < state->applied_ts_) {
                     continue;
@@ -538,6 +541,7 @@ private:
                 if (rpc.ts() == state->next_ts_) {
                     state->buffered_log_.push_back(rpc);
                     ++state->next_ts_;
+                    has_new_records = true;
                 }
             }
             if (msg.records_size()) {
@@ -545,6 +549,9 @@ private:
             }
             state->advance_to(std::min(msg.applied_ts(), state->durable_ts_));
             flush_event = state->flush_event_.future();
+        }
+        if (has_new_records) {
+            flusher_.trigger();
         }
         return flush_event.map([this](bool) { return state_.get()->create_response(true); });
     }
