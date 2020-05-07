@@ -25,19 +25,132 @@
 
 using duration = std::chrono::system_clock::duration;
 
+class DescriptorHolder {
+public:
+    static constexpr int kInvalidFd = -1;
 
-void write_uint64(int fd, uint64_t val) {
-    FATAL(write(fd, &val, sizeof(val)) != sizeof(val));
-}
-
-std::optional<uint64_t> read_uint64(int fd) {
-    uint64_t val;
-    if (read(fd, &val, sizeof(val)) == sizeof(val)) {
-        return val;
-    } else {
-        return std::nullopt;
+    DescriptorHolder() = default;
+    DescriptorHolder(int fd) : fd_(fd) {
+        FATAL(fd < 0);
     }
-}
+
+    DescriptorHolder(const DescriptorHolder&) = delete;
+
+    void set(int fd) {
+        if (fd_ != kInvalidFd && fd != fd_) {
+            close(fd_);
+        }
+        FATAL(fd < 0);
+        fd_ = fd;
+    }
+
+    int operator* () {
+        return fd_;
+    }
+
+    ~DescriptorHolder() {
+        if (fd_ != kInvalidFd) {
+            close(fd_);
+        }
+    }
+
+private:
+    int fd_ = kInvalidFd;
+};
+
+class BufferedFile {
+private:
+    static constexpr size_t bufsz_ = 128 << 10;
+
+public:
+    BufferedFile() = default;
+    BufferedFile(int fd) {
+        set_fd(fd);
+    }
+
+    void set_fd(int fd) {
+        fd_.set(fd);
+        data_ptr_ = consumed_ptr_ = 0;
+    }
+
+    size_t reserve(size_t sz) {
+        assert(sz <= bufsz_);
+        if (data_ptr_ + sz > bufsz_) {
+            flush();
+        }
+        auto result = data_ptr_;
+        data_ptr_ += sz;
+        return result;
+    }
+
+    std::optional<size_t> fetch(size_t sz) {
+        if (consumed_ptr_ + sz > data_ptr_) {
+            memmove(buffer_, buffer_ + consumed_ptr_, data_ptr_ - consumed_ptr_);
+            data_ptr_ -= consumed_ptr_;
+            consumed_ptr_ = 0;
+            auto read_bytes = read(*fd_, buffer_ + data_ptr_, bufsz_ - data_ptr_);
+            FATAL(read_bytes < 0);
+            data_ptr_ += read_bytes;
+        }
+        if (consumed_ptr_ + sz > data_ptr_) {
+            return std::nullopt;
+        } else {
+            auto result = consumed_ptr_;
+            consumed_ptr_ += sz;
+            return result;
+        }
+    }
+
+    void flush() {
+        FATAL(write(*fd_, buffer_, data_ptr_) != data_ptr_);
+        consumed_ptr_ = data_ptr_ = 0;
+    }
+
+    void write_uint64(uint64_t val) {
+        auto ptr = reserve(sizeof(val));
+        memcpy(&buffer_[ptr], &val, sizeof(val));
+    }
+
+    std::optional<uint64_t> read_uint64() {
+        uint64_t val;
+        if (auto ptr = fetch(sizeof(val))) {
+            memcpy(&val, &buffer_[*ptr], sizeof(val));
+            return val;
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    std::optional<LogRecord> read_log_record() {
+        auto header = read_uint64();
+        if (!header) { return std::nullopt; }
+        if (auto ptr = fetch(*header)) {
+            LogRecord record;
+            if (!record.ParseFromArray(&buffer_[*ptr], *header)) { return std::nullopt; }
+            return record;
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    void write_log_record(const LogRecord& record) {
+        auto sz = record.ByteSizeLong();
+        write_uint64(sz);
+        auto ptr = reserve(sz);
+        FATAL(!record.SerializeToArray(&buffer_[ptr], sz));
+    }
+
+    void sync() {
+        flush();
+        FATAL(fdatasync(*fd_) != 0);
+    }
+
+private:
+    DescriptorHolder fd_;
+    char buffer_[bufsz_];
+    size_t data_ptr_ = 0;
+    size_t consumed_ptr_ = 0;
+};
 
 class RaftNode : bus::ProtoBus {
 private:
@@ -53,31 +166,6 @@ private:
         kClientReq = 3,
     };
 
-    static constexpr int kInvalidFd = -1;
-
-    class DescriptorHolder {
-    public:
-        DescriptorHolder() = default;
-        DescriptorHolder(int fd) : fd_(fd) {
-            FATAL(fd < 0);
-        }
-
-        DescriptorHolder(const DescriptorHolder&) = delete;
-
-        int operator* () {
-            return fd_;
-        }
-
-        ~DescriptorHolder() {
-            if (fd_ != kInvalidFd) {
-                close(fd_);
-            }
-        }
-
-    private:
-        int fd_ = kInvalidFd;
-    };
-
     class VoteKeeper {
     public:
         VoteKeeper(std::string fname)
@@ -90,7 +178,7 @@ private:
             {
                 DescriptorHolder fd{open(tmp.c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)};
                 size_t sz = vote.ByteSizeLong();;
-                write_uint64(*fd, sz);
+                FATAL(write(*fd, &sz, sizeof(sz)) != sizeof(sz));
                 std::vector<char> data(sz);
                 vote.SerializeToArray(data.data(), data.size());
                 FATAL(write(*fd, data.data(), data.size()) != data.size());
@@ -103,9 +191,9 @@ private:
             struct stat buf;
             if (stat(fname_.c_str(), &buf) != 0) return std::nullopt;
             DescriptorHolder fd{open(fname_.c_str(), O_RDONLY)};
-            auto sz = read_uint64(*fd);
-            FATAL(!sz);
-            std::vector<char> data(*sz);
+            uint64_t sz;
+            FATAL(read(*fd, &sz, sizeof(sz)) != sizeof(sz));
+            std::vector<char> data(sz);
             FATAL(read(*fd, data.data(), data.size()) != data.size());
             VoteRpc result;
             FATAL(!result.ParseFromArray(data.data(), data.size()));
@@ -214,6 +302,7 @@ public:
         , rotator_([this] { rotate(); }, options.rotate_interval)
         , flusher_([this] { flush(); }, options.flush_interval)
         , sender_([this] { heartbeat_to_followers(); }, options.heartbeat_interval)
+        , stale_nodes_agent_( [this] { recover_stale_nodes(); }, options.heartbeat_interval)
     {
         {
             auto state = state_.get();
@@ -434,6 +523,25 @@ private:
         return flush_event.map([this](bool) { return state_.get()->create_response(true); });
     }
 
+    void recover_stale_nodes() {
+        std::vector<size_t> nodes;
+        std::vector<int64_t> nexts;
+        if (auto state = state_.get(); state->role_ == kLeader) {
+            for (size_t id = 0; id < options_.members; ++id) {
+                if (id_ != id) {
+                    if (state->next_timestamps_[id] < state->buffered_log_[0].ts()) {
+                        nodes.push_back(id);
+                        nexts.push_back(id);
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            auto node = nodes[i];
+            auto next = nexts[i];
+        }
+    }
+
     void heartbeat_to_followers() {
         std::vector<uint64_t> endpoints;
         std::vector<AppendRpcs> messages;
@@ -537,35 +645,11 @@ private:
         return parse_name(snapshot_fname_prefix, std::move(fname));
     }
 
-    std::optional<LogRecord> read_log_record(int fd) {
-        auto header = read_uint64(fd);
-        if (!header) { return std::nullopt; }
-        LogRecord record;
-        bus::SharedView v(buffer_pool_, *header);
-        if (read(fd, v.data(), v.size()) != v.size()) { return std::nullopt; }
-        if (!record.ParseFromArray(v.data(), v.size())) { return std::nullopt; }
-        return record;
-    }
-
-    bool write_log_record(int fd, const LogRecord& record, char* buf, size_t bufsz) {
-        if (record.ByteSizeLong() > bufsz) { return false; }
-        bufsz = record.ByteSizeLong();
-        write_uint64(fd, bufsz);
-        if (!record.SerializeToArray(buf, bufsz)) { return false; }
-        return (write(fd, buf, bufsz) == bufsz);
-    }
-
-    void write_log_record(int fd, const LogRecord& record) {
-        uint64_t sz = record.ByteSizeLong();
-        bus::SharedView v(buffer_pool_, sz);
-        FATAL(!write_log_record(fd, record, v.data(), v.size()));
-    }
-
     void flush() {
         std::vector<LogRecord> to_flush;
         bus::Promise<bool> to_deliver;
         // we want log records to be consecutive
-        auto log = log_fd_.get();
+        auto log = log_.get();
         size_t durable_ts;
 
         {
@@ -588,9 +672,9 @@ private:
 
         for (auto& record : to_flush) {
             spdlog::debug("write ts={0:d} to changelog", record.ts());
-            write_log_record(*log, record);
+            log->write_log_record(record);
         }
-        FATAL(fdatasync(*log) != 0);
+        log->sync();
 
         state_.get()->durable_ts_ = durable_ts;
 
@@ -613,17 +697,18 @@ private:
         }
         std::sort(snapshots.begin(), snapshots.end());
         std::sort(changelogs.begin(), changelogs.end());
+        BufferedFile io;
         while (!snapshots.empty()) {
             auto fname = snapshot_name(snapshots.back());
-            DescriptorHolder fd(open(fname.c_str(), O_RDONLY));
+            io.set_fd(open(fname.c_str(), O_RDONLY));
             bool valid = true;
-            std::optional<uint64_t> size = read_uint64(*fd);
-            std::optional<uint64_t> applied = read_uint64(*fd);
+            std::optional<uint64_t> size = io.read_uint64();
+            std::optional<uint64_t> applied = io.read_uint64();
             valid = size.has_value() && applied.has_value();
             std::unordered_map<std::string, std::string> fsm;
             if (valid) {
                 for (uint64_t i = 0; i < *size; ++i) {
-                    if (auto record = read_log_record(*fd)) {
+                    if (auto record = io.read_log_record()) {
                         state->apply(*record);
                     } else {
                         valid = false;
@@ -644,8 +729,8 @@ private:
         size_t first_changelog = 0;
         for (size_t i = 0; i < changelogs.size(); ++i) {
             auto fname = changelog_name(changelogs[i]);
-            DescriptorHolder fd(open(fname.c_str(), O_RDONLY));
-            auto durable_ts = read_uint64(*fd);
+            io.set_fd(open(fname.c_str(), O_RDONLY));
+            auto durable_ts = io.read_uint64();
             if (durable_ts && *durable_ts < state->applied_ts_) {
                 first_changelog = i;
             }
@@ -653,9 +738,9 @@ private:
         for (size_t i = first_changelog; i < changelogs.size(); ++i) {
             auto changelog = changelogs[i];
             auto fname = changelog_name(changelog);
-            DescriptorHolder fd(open(fname.c_str(), O_RDONLY));
-            if (!read_uint64(*fd)) continue;
-            while (auto rec = read_log_record(*fd)) {
+            io.set_fd(open(fname.c_str(), O_RDONLY));
+            if (!io.read_uint64()) continue;
+            while (auto rec = io.read_log_record()) {
                 if (rec->ts() > state->applied_ts_) {
                     state->buffered_log_.resize(std::max<size_t>(state->buffered_log_.size(), rec->ts() - state->applied_ts_));
                     state->buffered_log_[rec->ts() - state->applied_ts_ - 1] = *rec;
@@ -665,10 +750,9 @@ private:
             }
         }
         {
-            auto log_fd = log_fd_.get();
-            *log_fd = open(changelog_name(state->current_changelog_).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
-            FATAL(*log_fd < 0);
-            write_uint64(*log_fd, state->durable_ts_);
+            auto log = log_.get();
+            log->set_fd(open(changelog_name(state->current_changelog_).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR));
+            io.write_uint64(state->durable_ts_);
         }
         if (auto vote = vote_keeper_.get()->recover()) {
             state->current_term_ = vote->term();
@@ -681,21 +765,15 @@ private:
         size_t changelog_number;
         // sync calls under lock cos don't want to deal with partial states
         {
-            auto log_fd = log_fd_.get();
+            auto log = log_.get();
             auto state = state_.get();
-            if (*log_fd != kInvalidFd) {
-                close(*log_fd);
-            }
             changelog_number = ++state->current_changelog_;
-            *log_fd = open(changelog_name(changelog_number).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
-            FATAL(*log_fd < 0);
-            write_uint64(*log_fd, state->durable_ts_);
+            log->set_fd(open(changelog_name(changelog_number).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR));
+            log->write_uint64(state->durable_ts_);
         }
         // here we go dumpin'
-        int fd = open(snapshot_name(changelog_number).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
-        FATAL(fd < 0);
+        BufferedFile snapshot{open(snapshot_name(changelog_number).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)};
         State& unsafe_state_ptr = *state_.get();
-        bus::SharedView preallocated_buf(buffer_pool_, options_.bus_options.tcp_opts.max_message_size);
         bus::SharedView preallocated_arena_buf(buffer_pool_, options_.bus_options.tcp_opts.max_message_size);
         if (pid_t child = fork()) {
             FATAL(child < 0);
@@ -703,11 +781,10 @@ private:
             pid_t exited = waitpid(child, &wstatus, 0);
             FATAL(child != exited);
             FATAL(WEXITSTATUS(wstatus) != 0);
-            FATAL(close(fd) != 0)
         } else {
             State& state = unsafe_state_ptr;
-            write_uint64(fd, state.fsm_.size());
-            write_uint64(fd, state.applied_ts_);
+            snapshot.write_uint64(state.fsm_.size());
+            snapshot.write_uint64(state.applied_ts_);
             uint64_t applied_ts = state.applied_ts_;
             for (auto [k, v] : state.fsm_) {
                 google::protobuf::ArenaOptions options;
@@ -718,9 +795,9 @@ private:
                 auto* op = record->add_operations();
                 op->set_key(k);
                 op->set_value(v);
-                write_log_record(fd, *record, preallocated_buf.data(), preallocated_buf.size());
+                snapshot.write_log_record(*record);
             }
-            FATAL(fsync(fd) != 0);
+            snapshot.sync();
             _exit(0);
         }
     }
@@ -735,8 +812,9 @@ private:
     bus::internal::PeriodicExecutor flusher_;
     bus::internal::PeriodicExecutor rotator_;
     bus::internal::PeriodicExecutor sender_;
+    bus::internal::PeriodicExecutor stale_nodes_agent_;
 
-    bus::internal::ExclusiveWrapper<int> log_fd_{kInvalidFd};
+    bus::internal::ExclusiveWrapper<BufferedFile> log_;
 
     uint64_t id_;
 
