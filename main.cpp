@@ -454,7 +454,7 @@ private:
             state->leader_id_ = std::nullopt;
             state->latest_heartbeat_ = now;
         }
-        std::this_thread::sleep_for((options_.election_timeout * id_) / (options_.members * 2));
+        std::this_thread::sleep_for((options_.election_timeout * (rand()%options_.members)) / (options_.members * 2));
         std::vector<bus::Future<bus::ErrorT<Response>>> responses;
         std::vector<size_t> ids;
         {
