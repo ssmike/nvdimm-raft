@@ -40,6 +40,28 @@ public:
                 });
     }
 
+    bus::ErrorT<std::string> lookup(std::string key) {
+        ClientRequest req;
+        auto* op = req.add_operations();
+        op->set_type(ClientRequest::Operation::READ);
+        op->set_key(key);
+        ClientResponse response = execute(req).wait();
+        if (response.success() && response.entries_size() == 1) {
+            return bus::ErrorT<std::string>::value(response.entries()[0].value());
+        } else {
+            return bus::ErrorT<std::string>::error("fetch failed");
+        }
+    }
+
+    bool write(std::string key, std::string value) {
+        ClientRequest req;
+        auto* op = req.add_operations();
+        op->set_type(ClientRequest::Operation::WRITE);
+        op->set_key(std::move(key));
+        op->set_value(std::move(value));
+        return execute(req).wait().success();
+    }
+
 private:
     bus::Future<ClientResponse> bound_execute(ClientRequest req, size_t member) {
         return send<ClientRequest, ClientResponse>(req, member, kClientReq, timeout_)
@@ -81,25 +103,6 @@ int main(int argc, char** argv) {
 
     Client client(opts, manager, members.size(), parse_duration(conf["timeout"]));
 
-
-    {
-        ClientRequest req;
-        auto* op = req.add_operations();
-        op->set_type(ClientRequest::Operation::WRITE);
-        op->set_key("key");
-        op->set_value("value");
-        assert(client.execute(req).wait().success());
-    }
-
-    {
-        ClientRequest req;
-        auto* op = req.add_operations();
-        op->set_type(ClientRequest::Operation::READ);
-        op->set_key("key");
-        ClientResponse response = client.execute(req).wait();
-        assert(response.success());
-        assert(response.entries_size() == 1);
-        assert(response.entries(0).key() == "key");
-        assert(response.entries(0).value() == "value");
-    }
+    assert(client.write("key", "value"));
+    assert(client.lookup("key").unwrap() == "value");
 }

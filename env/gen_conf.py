@@ -32,6 +32,7 @@ confs = {
         'applied_backlog': 10000,
         'flush_interval': 0.005,
         'timeout': 2,
+        'rpc_max_batch': 10,
         'log': '%d.dir' % (i,)
     }
     for i in nodes
