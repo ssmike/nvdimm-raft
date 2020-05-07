@@ -29,7 +29,7 @@ confs = {
         'heartbeat_timeout': 0.01,
         'election_timeout': 4,
         'rotate_interval': 20,
-        'applied_backlog': 10000,
+        'applied_backlog': 0,
         'flush_interval': 0.005,
         'timeout': 2,
         'rpc_max_batch': 10,

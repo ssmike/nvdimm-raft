@@ -26,6 +26,7 @@ public:
         : ProtoBus(opts, manager)
         , timeout_(timeout)
     {
+        start();
     }
 
     bus::Future<ClientResponse> execute(ClientRequest req) {

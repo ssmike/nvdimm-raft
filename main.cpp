@@ -327,6 +327,9 @@ public:
         });
         sender_.delayed_start();
         elector_.delayed_start();
+        stale_nodes_agent_.start();
+
+        ProtoBus::start();
     }
 
     bus::internal::Event& shot_down() {
@@ -450,7 +453,7 @@ private:
             state->leader_id_ = std::nullopt;
             state->latest_heartbeat_ = now;
         }
-        std::this_thread::sleep_for((options_.election_timeout * id_) / options_.members);
+        std::this_thread::sleep_for((options_.election_timeout * id_) / (options_.members * 2));
         std::vector<bus::Future<bus::ErrorT<Response>>> responses;
         std::vector<size_t> ids;
         {
@@ -551,8 +554,9 @@ private:
         std::vector<int64_t> nexts;
         if (auto state = state_.get(); state->role_ == kLeader) {
             for (size_t id = 0; id < options_.members; ++id) {
+                int64_t ts = !state->buffered_log_.empty() ? state->buffered_log_[0].ts() : state->applied_ts_;
                 if (id_ != id) {
-                    if (state->next_timestamps_[id] < state->buffered_log_[0].ts()) {
+                    if (state->next_timestamps_[id] < ts) {
                         nodes.push_back(id);
                         nexts.push_back(id);
                     }
@@ -651,10 +655,14 @@ private:
                 rpcs.set_term(state->current_term_);
                 rpcs.set_applied_ts(state->applied_ts_);
                 if (state->buffered_log_.size() > 0) {
-                    const size_t start_ts = state->buffered_log_[0].ts();
-                    const size_t start_index = next_ts - start_ts;
-                    for (size_t i = start_index; i < state->buffered_log_.size() && rpcs.records_size() < options_.rpc_max_batch; ++i) {
-                        *rpcs.add_records() = state->buffered_log_[i];
+                    if (next_ts >= state->buffered_log_[0].ts()) {
+                        const size_t start_ts = state->buffered_log_[0].ts();
+                        const size_t start_index = next_ts - start_ts;
+                        for (size_t i = start_index; i < state->buffered_log_.size() && rpcs.records_size() < options_.rpc_max_batch; ++i) {
+                            *rpcs.add_records() = state->buffered_log_[i];
+                        }
+                    } else {
+                        spdlog::debug("skipping stale node {0:d}", id);
                     }
                 }
                 if (rpcs.records_size()) {
@@ -747,14 +755,14 @@ private:
             auto state = state_.get();
             auto& log = state->buffered_log_;
             size_t i = 0;
-            while (i < log.size() && log[i].ts() + options_.applied_backlog < state->applied_ts_) {
+            while (i < log.size() && log[i].ts() + options_.applied_backlog <= state->applied_ts_) {
                 ++i;
             }
             to_flush.insert(to_flush.begin(), log.begin() + state->flushed_index_, log.end());
-            log.erase(log.begin(), log.begin() + i);
             if (i > 0) {
-                spdlog::debug("erased up to ts={0:d} record", i);
+                spdlog::debug("erased up to ts={0:d} record", state->buffered_log_[i - 1].ts());
             }
+            log.erase(log.begin(), log.begin() + i);
             state->flushed_index_ = log.size();
             to_deliver.swap(state->flush_event_);
             durable_ts = !state->buffered_log_.empty() ? state->buffered_log_.back().ts() : state->durable_ts_;
@@ -782,6 +790,7 @@ private:
         if (!size.has_value() || !applied.has_value()) {
             return false;
         }
+        ts = *applied;
         for (uint64_t i = 0; i < *size; ++i) {
             if (auto record = io.read_log_record()) {
                 for (auto& op : record->operations()) {
@@ -860,10 +869,12 @@ private:
             if (!io.read_uint64()) continue;
             iterate_changelog(io,
                 [&](auto rec) {
-                    state->buffered_log_.resize(std::max<size_t>(state->buffered_log_.size(), rec.ts() - state->applied_ts_));
-                    state->buffered_log_[rec.ts() - state->applied_ts_ - 1] = rec;
-                    state->next_ts_ = std::max<size_t>(state->next_ts_, rec.ts() + 1);
-                    state->durable_ts_ = std::max<ssize_t>(state->durable_ts_, rec.ts());
+                    if (rec.ts() > state->applied_ts_) {
+                        state->buffered_log_.resize(std::max<size_t>(state->buffered_log_.size(), rec.ts() - state->applied_ts_));
+                        state->buffered_log_[rec.ts() - state->applied_ts_ - 1] = rec;
+                        state->next_ts_ = std::max<size_t>(state->next_ts_, rec.ts() + 1);
+                        state->durable_ts_ = std::max<ssize_t>(state->durable_ts_, rec.ts());
+                    }
                 });
         }
         {
