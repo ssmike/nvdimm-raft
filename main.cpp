@@ -565,9 +565,8 @@ private:
         }
 
         BufferedFile io;
-        for (size_t i = 0; i < nodes.size(); ++i) {
-            auto node = nodes[i];
-            auto next = nexts[i];
+
+        auto recover_node = [&](size_t node, int64_t next) {
             uint64_t snapshot_ts = 0;
             spdlog::info("starting recovery for {0:d} ts={1:d}", node, next);
             auto snapshots = discover_snapshots();
@@ -633,6 +632,10 @@ private:
                 }
                 send<AppendRpcs, Response>(std::move(rpc), node, kAppendRpcs, options_.heartbeat_timeout).wait();
             }
+        };
+
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            recover_node(nodes[i], nexts[i]);
         }
     }
 
@@ -654,15 +657,11 @@ private:
                 AppendRpcs rpcs;
                 rpcs.set_term(state->current_term_);
                 rpcs.set_applied_ts(state->applied_ts_);
-                if (state->buffered_log_.size() > 0) {
-                    if (next_ts >= state->buffered_log_[0].ts()) {
-                        const size_t start_ts = state->buffered_log_[0].ts();
-                        const size_t start_index = next_ts - start_ts;
-                        for (size_t i = start_index; i < state->buffered_log_.size() && rpcs.records_size() < options_.rpc_max_batch; ++i) {
-                            *rpcs.add_records() = state->buffered_log_[i];
-                        }
-                    } else {
-                        spdlog::debug("skipping stale node {0:d}", id);
+                if (state->buffered_log_.size() > 0 && next_ts >= state->buffered_log_[0].ts()) {
+                    const size_t start_ts = state->buffered_log_[0].ts();
+                    const size_t start_index = next_ts - start_ts;
+                    for (size_t i = start_index; i < state->buffered_log_.size() && rpcs.records_size() < options_.rpc_max_batch; ++i) {
+                        *rpcs.add_records() = state->buffered_log_[i];
                     }
                 }
                 if (rpcs.records_size()) {
