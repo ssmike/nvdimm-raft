@@ -520,7 +520,7 @@ private:
             state->latest_heartbeat_ = std::chrono::system_clock::now();
             state->leader_id_ = id;
             for (auto& rpc : msg.records()) {
-                if (rpc.ts() > state->applied_ts_) {
+                if (rpc.ts() < state->applied_ts_) {
                     continue;
                 }
                 if (state->next_ts_ > rpc.ts()) {
@@ -649,6 +649,7 @@ private:
                 endpoints.push_back(id);
                 AppendRpcs rpcs;
                 rpcs.set_term(state->current_term_);
+                rpcs.set_applied_ts(state->applied_ts_);
                 if (state->buffered_log_.size() > 0) {
                     const size_t start_ts = state->buffered_log_[0].ts();
                     const size_t start_index = next_ts - start_ts;
@@ -747,21 +748,22 @@ private:
             auto& log = state->buffered_log_;
             size_t i = 0;
             while (i < log.size() && log[i].ts() + options_.applied_backlog < state->applied_ts_) {
-                spdlog::debug("deleting old record with ts={0:d} applied_ts={1:d}", log[i].ts(), state->applied_ts_);
                 ++i;
             }
             to_flush.insert(to_flush.begin(), log.begin() + state->flushed_index_, log.end());
             log.erase(log.begin(), log.begin() + i);
             if (i > 0) {
-                spdlog::debug("erased up to {0:d}'th record", i);
+                spdlog::debug("erased up to ts={0:d} record", i);
             }
             state->flushed_index_ = log.size();
             to_deliver.swap(state->flush_event_);
             durable_ts = !state->buffered_log_.empty() ? state->buffered_log_.back().ts() : state->durable_ts_;
         }
 
+        if (to_flush.size()) {
+            spdlog::debug("write from {0:d} to {1:d} to changelog", to_flush[0].ts(), to_flush.back().ts());
+        }
         for (auto& record : to_flush) {
-            spdlog::debug("write ts={0:d} to changelog", record.ts());
             log->write_log_record(record);
         }
         log->sync();
@@ -855,6 +857,7 @@ private:
         for (size_t i = first_changelog; i < changelogs.size(); ++i) {
             auto fname = changelog_name(changelogs[i]);
             io.set_fd(open(fname.c_str(), O_RDONLY));
+            if (!io.read_uint64()) continue;
             iterate_changelog(io,
                 [&](auto rec) {
                     state->buffered_log_.resize(std::max<size_t>(state->buffered_log_.size(), rec.ts() - state->applied_ts_));
