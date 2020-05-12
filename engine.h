@@ -286,10 +286,10 @@ private:
             return std::nullopt;
         }
         size_t pos = 0;
-        while (pos < root->key_count && root->keys[pos] < key) {
-            ++pos;
-        }
         if (root->is_leaf) {
+            while (pos < root->key_count && root->keys[pos] < key) {
+                ++pos;
+            }
             assert(root->keys[pos] == key);
             KeyNode result = *root;
             for (size_t i = pos; i < root->key_count; ++i) {
@@ -300,48 +300,88 @@ private:
             if (result.key_count == 0) {
                 return std::nullopt;
             } else {
+                assert_node(&result);
                 return result;
             }
         } else {
+            while (pos + 1 < root->key_count && root->keys[pos + 1] <= key) {
+                ++pos;
+            }
             auto subnode = erase((KeyNode*)root->children[pos].get(), key);
+            //if (root->key_count == 1) {
+            //    return subnode;
+            //}
             assert(subnode);
             KeyNode node = *root;
             if (subnode->key_count < min_children) {
                 int di = pos == 0 && pos + 1 < subnode->key_count ? 1 : -1;
                 KeyNode* nodes[2];
-                if (di < 0) {
-                    nodes[0] = node.child(pos + di).get();
+                if (pos == 0 || pos + 1 < subnode->key_count) {
+                    nodes[0] = &*subnode;
+                    nodes[1] = node.child(pos + 1).get();
+                } else {
+                    nodes[0] = node.child(pos - 1).get();
                     nodes[1] = &*subnode;
                     --pos;
-                } else {
-                    nodes[1] = node.child(pos + di).get();
-                    nodes[0] = &*subnode;
                 }
+                assert_node(nodes[0]);
+                assert_node(nodes[1]);
+
+                size_t secondary_count = nodes[0]->key_count + nodes[1]->key_count;
+                size_t cut = secondary_count;
+
                 node.children[pos] = (char*)allocate<KeyNode>();
-                node.children[pos + 1] = (char*)allocate<KeyNode>();
-                node.child(pos)->key_count = node.child(pos + 1)->key_count = 0;
-                node.child(pos)->is_leaf = node.child(pos + 1)->is_leaf = subnode->is_leaf;
+                node.child(pos)->key_count = 0;
+                node.child(pos)->is_leaf = subnode->is_leaf;
+
+                if (secondary_count >= 2 * min_children) {
+                    node.children[pos + 1] = (char*)allocate<KeyNode>();
+                    node.child(pos + 1)->key_count = 0;
+                    node.child(pos + 1)->is_leaf = subnode->is_leaf;
+                    cut = min_children;
+                } else {
+                    node.children[pos + 1] = nullptr;
+                    cut = secondary_count;
+                }
+
                 auto add_kv = [&](PersistentStr key, pmem::obj::persistent_ptr<char> value) {
-                    auto ptr = node.child(pos);
-                    if (ptr->key_count >= min_children) {
-                        ptr = node.child(pos + 1);
+                    auto ptr = node.child(pos).get();
+                    if (ptr->key_count >= cut) {
+                        ptr = node.child(pos + 1).get();
                     }
                     ptr->keys[ptr->key_count] = key;
                     ptr->children[ptr->key_count] = value;
                     ++ptr->key_count;
+                    assert(ptr->key_count <= max_children);
+                    assert_node(ptr);
                 };
 
                 for (size_t i = 0; i < 2; ++i) {
-                    auto ptr = node.child(pos + i);
+                    auto ptr = nodes[i];
                     for (size_t j = 0; j < ptr->key_count; ++j) {
                         add_kv(ptr->keys[j], ptr->child(j).raw());
                     }
+                    if (node.child(pos + i)) {
+                        node.keys[pos + i] = node.child(pos + i)->keys[0];
+                    }
                 }
 
+                if (!node.child(pos + 1)) {
+                    for (ssize_t i = pos + 1; i < node.key_count; ++i) {
+                        node.children[i] = node.children[i + 1];
+                        node.keys[i] = node.keys[i + 1];
+                    }
+                    --node.key_count;
+                }
+
+                assert_node(&node);
                 return node;
             } else {
-                node.children[pos] = (char*)allocate<KeyNode>();
+                auto child = allocate<KeyNode>();
+                *child = *subnode;
+                node.children[pos] = (char*)child;
                 node.keys[pos] = subnode->keys[0];
+                assert_node(&node);
                 return node;
             }
         }
@@ -438,8 +478,14 @@ public:
         if (lookup(key)) {
             auto root = erase(volatile_root_, key);
             if (root) {
-                volatile_root_ = allocate<KeyNode>();
-                *volatile_root_ = *root;
+                if (root->is_leaf || root->key_count > 1) {
+                    volatile_root_ = allocate<KeyNode>();
+                    *volatile_root_ = *root;
+                } else {
+                    volatile_root_ = root->child(0).get();
+                }
+            } else {
+                volatile_root_ = nullptr;
             }
         }
     }
