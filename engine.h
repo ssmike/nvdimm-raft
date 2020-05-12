@@ -37,12 +37,20 @@ public:
             return std::string_view{data(), size()} < std::string_view{oth.data(), oth.size()};
         }
 
+        bool operator > (const std::string_view& oth) {
+            return std::string_view{data(), size()} > oth;
+        }
+
         bool operator <= (const std::string_view& oth) {
             return std::string_view{data(), size()} <= oth;
         }
 
         bool operator >= (const std::string_view& oth) {
             return std::string_view{data(), size()} >= oth;
+        }
+
+        bool operator == (const std::string_view& oth) {
+            return std::string_view{data(), size()} == oth;
         }
     };
 
@@ -58,7 +66,9 @@ private:
 
         bool is_leaf;
 
-        //pmem::obj::persistent_ptr<>
+        pmem::obj::persistent_ptr<KeyNode> child(size_t i) {
+            return children[i].raw();
+        }
     };
 
     struct Page {
@@ -143,7 +153,7 @@ private:
             return { root };
         } else {
             size_t pos = 0;
-            while (pos < root->key_count && key < PersistentStr{root->children[pos]}) {
+            while (pos < root->key_count && key < root->keys[pos]) {
                 ++pos;
             }
 
@@ -156,7 +166,7 @@ private:
                 insert_key = key;
                 insert_value = value.ptr_;
             } else {
-                auto result = insert((KeyNode*)root->children[pos].get(), key, value);
+                auto result = insert(root->child(pos).get(), key, value);
 
                 new_root.keys[pos] = result.left->keys[0];
                 new_root.children[pos] = (char*)result.left;
@@ -203,6 +213,72 @@ private:
                 auto result = allocate<KeyNode>();
                 *result = new_root;
                 return { result };
+            }
+        }
+    }
+
+    std::optional<KeyNode> erase(KeyNode* root, std::string_view key) {
+        if (root == nullptr) {
+            return std::nullopt;
+        }
+        size_t pos = 0;
+        while (pos < root->key_count && root->keys[pos] > key) {
+            ++pos;
+        }
+        if (root->is_leaf) {
+            assert(root->keys[pos] == key);
+            KeyNode result = *root;
+            for (size_t i = pos; i < root->key_count; ++i) {
+                result.children[i] = result.children[i + 1];
+                result.keys[i] = result.keys[i + 1];
+            }
+            --result.key_count;
+            if (result.key_count == 0) {
+                return std::nullopt;
+            } else {
+                return result;
+            }
+        } else {
+            auto subnode = erase((KeyNode*)root->children[pos].get(), key);
+            assert(subnode);
+            KeyNode node = *root;
+            if (subnode->key_count < min_children) {
+                int di = pos == 0 && pos + 1 < subnode->key_count ? 1 : -1;
+                KeyNode* nodes[2];
+                if (di < 0) {
+                    nodes[0] = node.child(pos + di).get();
+                    nodes[1] = &*subnode;
+                    --pos;
+                } else {
+                    nodes[1] = node.child(pos + di).get();
+                    nodes[0] = &*subnode;
+                }
+                node.children[pos] = (char*)allocate<KeyNode>();
+                node.children[pos + 1] = (char*)allocate<KeyNode>();
+                node.child(pos)->key_count = node.child(pos + 1)->key_count = 0;
+                node.child(pos)->is_leaf = node.child(pos + 1)->is_leaf = subnode->is_leaf;
+                auto add_kv = [&](PersistentStr key, pmem::obj::persistent_ptr<char> value) {
+                    auto ptr = node.child(pos);
+                    if (ptr->key_count >= min_children) {
+                        ptr = node.child(pos + 1);
+                    }
+                    ptr->keys[ptr->key_count] = key;
+                    ptr->children[ptr->key_count] = value;
+                    ++ptr->key_count;
+                };
+
+                for (size_t i = 0; i < 2; ++i) {
+                    auto ptr = node.child(pos + i);
+                    for (size_t j = 0; j < ptr->key_count; ++j) {
+                        add_kv(ptr->keys[j], ptr->child(j).raw());
+                    }
+                }
+
+                return node;
+            } else {
+                node.children[pos] = (char*)allocate<KeyNode>();
+                node.keys[pos] = subnode->keys[0];
+                return node;
             }
         }
     }
@@ -286,7 +362,10 @@ public:
         return result;
     }
 
-    void erase(std::string_view);
+    void erase(std::string_view key) {
+        if (lookup(key)) {
+        }
+    }
 
     void commit();
 
