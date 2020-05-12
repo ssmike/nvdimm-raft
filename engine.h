@@ -364,10 +364,23 @@ public:
 
     void erase(std::string_view key) {
         if (lookup(key)) {
+            auto root = erase(volatile_root_, key);
+            if (root) {
+                volatile_root_ = allocate<KeyNode>();
+                *volatile_root_ = *root;
+            }
         }
     }
 
-    void commit();
+    void commit() {
+        flush();
+        pmem::obj::transaction::run(
+            pool_,
+            [&] {
+                root_->stale_roots_.push_back(root_->durable_root_);
+                root_->durable_root_ = volatile_root_;
+            });
+    }
 
     void gc();
 
