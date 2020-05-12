@@ -22,7 +22,14 @@ public:
         }
 
         size_t size() const {
-            return *reinterpret_cast<uint64_t*>(ptr_.get());
+            if (ptr_)
+                return *reinterpret_cast<uint64_t*>(ptr_.get());
+            else
+                return 0;
+        }
+
+        void set_size(uint64_t sz) {
+            *reinterpret_cast<uint64_t*>(ptr_.get()) = sz;
         }
 
         static size_t size(size_t chars) {
@@ -37,8 +44,16 @@ public:
             return std::string_view{data(), size()} < std::string_view{oth.data(), oth.size()};
         }
 
-        bool operator > (const std::string_view& oth) {
-            return std::string_view{data(), size()} > oth;
+        bool operator <= (const PersistentStr& oth) {
+            return std::string_view{data(), size()} <= std::string_view{oth.data(), oth.size()};
+        }
+
+        bool operator == (const PersistentStr& oth) {
+            return std::string_view{data(), size()} == std::string_view{oth.data(), oth.size()};
+        }
+
+        bool operator < (const std::string_view& oth) {
+            return std::string_view{data(), size()} < oth;
         }
 
         bool operator <= (const std::string_view& oth) {
@@ -98,7 +113,7 @@ private:
                 pmem::obj::transaction::run(
                     pool_,
                     [&] {
-                        root_->free_pages = pmem::obj::make_persistent<Page>(pool_);
+                        root_->free_pages = pmem::obj::make_persistent<Page>();
                     });
             }
             auto page = root_->free_pages;
@@ -143,6 +158,37 @@ private:
         KeyNode* right = nullptr;
     };
 
+    PersistentStr prevkey;
+    void traverse(KeyNode* node) {
+        if (!node) return;
+        if (node->is_leaf) {
+            for (size_t i = 0; i < node->key_count; ++i) {
+                assert(prevkey < node->keys[i]);
+                prevkey = node->keys[i];
+            }
+        } else {
+            for (size_t i = 0; i < node->key_count; ++i) {
+                traverse(node->child(i).get());
+            }
+        }
+    }
+
+    void assert_node(KeyNode* node) {
+        for (size_t i = 0; i + 1 < node->key_count; ++i) {
+            assert(node->keys[i] < node->keys[i + 1]);
+        }
+        prevkey = PersistentStr{};
+        if (!node->is_leaf) {
+            for (size_t i = 0; i < node->key_count; ++i) {
+                assert(node->keys[i] == node->child(i)->keys[0]);
+                assert(prevkey < node->keys[i]);
+                traverse(node->child(i).get());
+            }
+        }
+        prevkey = PersistentStr{};
+        traverse(node);
+    }
+
     InsertResult insert(KeyNode* root, PersistentStr key, PersistentStr value) {
         if (root == nullptr) {
             root = allocate<KeyNode>();
@@ -150,29 +196,45 @@ private:
             root->keys[0] = key;
             root->children[0] = value.ptr_;
             root->is_leaf = true;
+            assert_node(root);
             return { root };
         } else {
             size_t pos = 0;
-            while (pos < root->key_count && key < root->keys[pos]) {
-                ++pos;
-            }
 
             PersistentStr insert_key;
             pmem::obj::persistent_ptr<char> insert_value;
 
-            KeyNode new_root = *root;
+            KeyNode new_root;
 
             if (root->is_leaf) {
+                while (pos < root->key_count && root->keys[pos] < key) {
+                    ++pos;
+                }
                 insert_key = key;
                 insert_value = value.ptr_;
+                new_root = *root;
             } else {
+                while (pos + 1 < root->key_count && root->keys[pos + 1] <= key) {
+                    ++pos;
+                }
                 auto result = insert(root->child(pos).get(), key, value);
 
-                new_root.keys[pos] = result.left->keys[0];
-                new_root.children[pos] = (char*)result.left;
+                if (result.right) {
+                    new_root = *root;
+                    new_root.keys[pos] = result.left->keys[0];
+                    new_root.children[pos] = (char*)result.left;
 
-                insert_key = result.right->keys[0];
-                insert_value = (char*)result.right;
+                    insert_key = result.right->keys[0];
+                    insert_value = (char*)result.right;
+                    ++pos;
+                } else {
+                    auto ret = allocate<KeyNode>();
+                    *ret = *root;
+                    ret->keys[pos] = result.left->keys[0];
+                    ret->children[pos] = (char*)result.left;
+                    assert_node(ret);
+                    return { ret };
+                }
             }
 
             if (new_root.key_count == max_children) {
@@ -180,38 +242,40 @@ private:
                 result.left = allocate<KeyNode>();
                 result.right = allocate<KeyNode>();
                 result.left->key_count = result.right->key_count = 0;
-                result.left->is_leaf = result.right->is_leaf = true;
+                result.left->is_leaf = result.right->is_leaf = root->is_leaf;
 
                 auto add_key = [&, index=0] (PersistentStr key, pmem::obj::persistent_ptr<char> value) mutable {
                     size_t mid = (max_children+1)/2;
-                    if (index < mid) {
-                        result.left->keys[result.left->key_count] = key;
-                        result.left->children[result.left->key_count] = value;
-                        ++result.left->key_count;
-                    } else {
-                        result.right->keys[result.right->key_count] = key;
-                        result.right->children[result.right->key_count] = value;
-                        ++result.right->key_count;
+                    auto ptr = result.left;
+                    if (index >= mid) {
+                        ptr = result.right;
                     }
+                    ptr->keys[ptr->key_count] = key;
+                    ptr->children[ptr->key_count] = value;
+                    ++ptr->key_count;
+                    assert_node(ptr);
                     ++index;
                 };
 
                 for (size_t i = 0; i < pos; ++i)
-                    add_key(new_root.keys[i], root->children[i]);
+                    add_key(new_root.keys[i], new_root.children[i]);
                 add_key(insert_key, insert_value);
                 for (size_t i = pos; i < max_children; ++i)
-                    add_key(new_root.keys[i], root->children[i]);
+                    add_key(new_root.keys[i], new_root.children[i]);
+                assert_node(result.left);
+                assert_node(result.right);
                 return result;
             } else {
                 ++new_root.key_count;
-                for (ssize_t i = root->key_count - 1; i > pos; --i) {
+                for (ssize_t i = new_root.key_count - 1; i > pos; --i) {
                     new_root.keys[i] = new_root.keys[i - 1];
                     new_root.children[i] = new_root.children[i - 1];
                 }
-                new_root.keys[pos] = key;
-                new_root.children[pos] = value.ptr_;
+                new_root.keys[pos] = insert_key;
+                new_root.children[pos] = insert_value;
                 auto result = allocate<KeyNode>();
                 *result = new_root;
+                assert_node(result);
                 return { result };
             }
         }
@@ -222,7 +286,7 @@ private:
             return std::nullopt;
         }
         size_t pos = 0;
-        while (pos < root->key_count && root->keys[pos] > key) {
+        while (pos < root->key_count && root->keys[pos] < key) {
             ++pos;
         }
         if (root->is_leaf) {
@@ -322,7 +386,15 @@ public:
     }
 
     PersistentStr allocate_str(size_t sz) {
-        return { allocate(PersistentStr::size(sz), PersistentStr::align()) };
+        PersistentStr result{  allocate(PersistentStr::size(sz), PersistentStr::align()) };
+        result.set_size(sz);
+        return result;
+    }
+
+    PersistentStr copy_str(std::string_view v) {
+        PersistentStr result = allocate_str(v.size());
+        memcpy(result.data(), v.data(), v.size());
+        return result;
     }
 
     void insert(PersistentStr key, PersistentStr value) {
@@ -330,7 +402,7 @@ public:
         if (result.right) {
             volatile_root_ = allocate<KeyNode>();
             volatile_root_->is_leaf = false;
-            volatile_root_->key_count = 1;
+            volatile_root_->key_count = 2;
             volatile_root_->keys[0] = result.left->keys[0];
             volatile_root_->keys[1] = result.right->keys[0];
             volatile_root_->children[0] = (char*)result.left;
@@ -368,6 +440,18 @@ public:
             if (root) {
                 volatile_root_ = allocate<KeyNode>();
                 *volatile_root_ = *root;
+            }
+        }
+    }
+
+    void dbgOut(KeyNode* root = nullptr) {
+        if (!root) root = volatile_root_;
+        if (!root) return;
+        for (size_t i = 0; i < root->key_count; ++i) {
+            if (root->is_leaf) {
+                std::cerr << std::string_view{root->keys[i].data(), root->keys[i].size()} << " ";
+            } else {
+                dbgOut(root->child(i).get());
             }
         }
     }
