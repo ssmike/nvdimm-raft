@@ -157,15 +157,6 @@ private:
         return (T*)allocate(sizeof(T), alignof(T));
     }
 
-    void flush() {
-        for (auto [page, start] : dirty_pages_) {
-            pool_.flush(page->used);
-            pool_.flush(&page->data[start], page->used - start);
-        }
-        dirty_pages_.clear();
-        pool_.drain();
-    }
-
     struct InsertResult {
         KeyNode* left = nullptr;
         KeyNode* right = nullptr;
@@ -554,8 +545,19 @@ public:
         }
     }
 
-    void commit() {
-        flush();
+    void sync() {
+        pool_.drain();
+    }
+
+    void flush() {
+        for (auto [page, start] : dirty_pages_) {
+            pool_.flush(page->used);
+            pool_.flush(&page->data[start], page->used - start);
+        }
+        dirty_pages_.clear();
+    }
+
+    void store_root() {
         pmem::obj::transaction::run(
             pool_,
             [&] {
@@ -563,6 +565,12 @@ public:
                 root_->durable_root_ = volatile_root_;
             },
             root_->lock);
+    }
+
+    void commit() {
+        flush();
+        sync();
+        store_root();
     }
 
     void gc() {
