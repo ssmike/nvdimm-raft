@@ -73,7 +73,7 @@ public:
 private:
     static constexpr size_t page_sz_ = 8192;
 
-    static constexpr size_t max_children = 3;
+    static constexpr size_t max_children = 4;
     static constexpr size_t min_children = 2;
     struct KeyNode {
         std::array<pmem::obj::persistent_ptr<char>, max_children> children;
