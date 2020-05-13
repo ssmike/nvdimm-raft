@@ -4,6 +4,7 @@
 #include "executor.h"
 #include "error.h"
 #include "client.pb.h"
+#include "engine.h"
 
 #include <google/protobuf/arena.h>
 
@@ -25,169 +26,105 @@
 
 using duration = std::chrono::system_clock::duration;
 
-class DescriptorHolder {
+template<typename T>
+class DelayedSetter {
 public:
-    static constexpr int kInvalidFd = -1;
-
-    DescriptorHolder() = default;
-    DescriptorHolder(int fd) : fd_(fd) {
-        FATAL(fd < 0);
+    DelayedSetter() = default;
+    DelayedSetter(bus::Promise<T> p) {
+        promise_.emplace(std::move(p));
     }
 
-    DescriptorHolder(const DescriptorHolder&) = delete;
+    DelayedSetter(const DelayedSetter<T>&) = default;
+    DelayedSetter(DelayedSetter<T>&&) = default;
+    DelayedSetter<T>& operator = (const DelayedSetter<T>&) = default;
+    DelayedSetter<T>& operator = (DelayedSetter<T>&&) = default;
 
-    void set(int fd) {
-        if (fd_ != kInvalidFd && fd != fd_) {
-            close(fd_);
+    void set() {
+        if (promise_) {
+            promise_->set_value_once();
         }
-        FATAL(fd < 0);
-        fd_ = fd;
+        promise_.reset();
     }
 
-    int operator* () {
-        return fd_;
-    }
-
-    ~DescriptorHolder() {
-        if (fd_ != kInvalidFd) {
-            close(fd_);
-        }
+    ~DelayedSetter() {
+        set();
     }
 
 private:
-    int fd_ = kInvalidFd;
+    std::optional<bus::Promise<T>> promise_;
 };
 
-class BufferedFile {
-private:
-    static constexpr size_t bufsz_ = 128 << 10;
-
-public:
-    BufferedFile() = default;
-    BufferedFile(int fd) {
-        set_fd(fd);
-    }
-
-    void set_fd(int fd) {
-        fd_.set(fd);
-        data_ptr_ = consumed_ptr_ = 0;
-    }
-
-    size_t reserve(size_t sz) {
-        assert(sz <= bufsz_);
-        if (data_ptr_ + sz > bufsz_) {
-            flush();
+namespace {
+    std::string ts_to_str(uint64_t id) {
+        std::string str;
+        str.resize(sizeof(id));
+        for (ssize_t i = sizeof(id) - 1; i >= 0; --i) {
+            str[i] = id & 255;
         }
-        auto result = data_ptr_;
-        data_ptr_ += sz;
-        return result;
+        return str;
     }
 
-    std::optional<size_t> fetch(size_t sz) {
-        if (consumed_ptr_ + sz > data_ptr_) {
-            memmove(buffer_, buffer_ + consumed_ptr_, data_ptr_ - consumed_ptr_);
-            data_ptr_ -= consumed_ptr_;
-            consumed_ptr_ = 0;
-            auto read_bytes = read(*fd_, buffer_ + data_ptr_, bufsz_ - data_ptr_);
-            FATAL(read_bytes < 0);
-            data_ptr_ += read_bytes;
+    std::string rollback_key(uint64_t id) {
+        return "_rollback" + ts_to_str(id);
+    }
+
+    std::string rollback_start_key() {
+        return "_rollback";
+    }
+
+    std::string base_key(std::string key, int64_t ts) {
+        key += "_";
+        key += std::string_view((char*)&ts, sizeof(ts));
+        return key;
+    }
+
+    bool reserved_key(std::string_view key) {
+        for (size_t i = 0; i < key.size(); ++i) {
+            if (key[i] == '_') {
+                return true;
+            }
         }
-        if (consumed_ptr_ + sz > data_ptr_) {
-            return std::nullopt;
-        } else {
-            auto result = consumed_ptr_;
-            consumed_ptr_ += sz;
-            return result;
-        }
+        return false;
     }
-
-    void flush() {
-        FATAL(write(*fd_, buffer_, data_ptr_) != data_ptr_);
-        consumed_ptr_ = data_ptr_ = 0;
-    }
-
-    void write_uint64(uint64_t val) {
-        auto ptr = reserve(sizeof(val));
-        memcpy(&buffer_[ptr], &val, sizeof(val));
-    }
-
-    std::optional<uint64_t> read_uint64() {
-        uint64_t val;
-        if (auto ptr = fetch(sizeof(val))) {
-            memcpy(&val, &buffer_[*ptr], sizeof(val));
-            return val;
-        } else {
-            return std::nullopt;
-        }
-    }
-
-    std::optional<LogRecord> read_log_record() {
-        auto header = read_uint64();
-        if (!header) { return std::nullopt; }
-        if (auto ptr = fetch(*header)) {
-            LogRecord record;
-            if (!record.ParseFromArray(&buffer_[*ptr], *header)) { return std::nullopt; }
-            return record;
-        } else {
-            return std::nullopt;
-        }
-    }
-
-    void write_log_record(const LogRecord& record) {
-        auto sz = record.ByteSizeLong();
-        write_uint64(sz);
-        auto ptr = reserve(sz);
-        FATAL(!record.SerializeToArray(&buffer_[ptr], sz));
-    }
-
-    void sync() {
-        flush();
-        FATAL(fdatasync(*fd_) != 0);
-    }
-
-private:
-    DescriptorHolder fd_;
-    char buffer_[bufsz_];
-    size_t data_ptr_ = 0;
-    size_t consumed_ptr_ = 0;
-};
+}
 
 class VoteKeeper {
+private:
+    static constexpr std::string_view key_name = "_vote";
+
 public:
-    VoteKeeper(std::string fname)
-        : fname_(fname)
-    {
+    VoteKeeper() = default;
+
+    VoteKeeper(Engine& engine) {
+        reset(engine);
+    }
+
+    void reset(Engine& engine) {
+        engine_ = &engine;
+        key_ = engine_->copy_str(key_name);
     }
 
     void store(VoteRpc vote) {
-        auto tmp = fname_ + ".tmp";
-        {
-            DescriptorHolder fd{open(tmp.c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)};
-            size_t sz = vote.ByteSizeLong();;
-            FATAL(write(*fd, &sz, sizeof(sz)) != sizeof(sz));
-            std::vector<char> data(sz);
-            vote.SerializeToArray(data.data(), data.size());
-            FATAL(write(*fd, data.data(), data.size()) != data.size());
-            FATAL(fdatasync(*fd) != 0);
-        }
-        FATAL(rename(tmp.c_str(), fname_.c_str()) != 0);
+        auto str = engine_->allocate_str(vote.ByteSizeLong());
+        vote.SerializeToArray(str.data(), str.size());
+        engine_->erase(key_name);
+        engine_->insert(key_, str);
+        engine_->commit();
     }
 
     std::optional<VoteRpc> recover() {
-        struct stat buf;
-        if (stat(fname_.c_str(), &buf) != 0) return std::nullopt;
-        DescriptorHolder fd{open(fname_.c_str(), O_RDONLY)};
-        uint64_t sz;
-        FATAL(read(*fd, &sz, sizeof(sz)) != sizeof(sz));
-        std::vector<char> data(sz);
-        FATAL(read(*fd, data.data(), data.size()) != data.size());
-        VoteRpc result;
-        FATAL(!result.ParseFromArray(data.data(), data.size()));
-        return result;
+        if (auto vote = engine_->lookup(key_name)) {
+            VoteRpc result;
+            FATAL(!result.ParseFromArray(vote->data(), vote->size()));
+            return result;
+        } else {
+            return std::nullopt;
+        }
     }
 
 private:
-    std::string fname_;
+    Engine* engine_ = nullptr;
+    Engine::PersistentStr key_;
 };
 
 class RaftNode : bus::ProtoBus {
@@ -223,11 +160,13 @@ private:
 
         std::unordered_map<int64_t, bus::Promise<bool>> commit_subscribers_;
 
+        ssize_t applied_backlog;
         size_t flushed_index_ = 0;
         std::vector<LogRecord> buffered_log_;
         bus::Promise<bool> flush_event_;
 
-        std::unordered_map<std::string, std::string> fsm_;
+        VoteKeeper vote_keeper_;
+        Engine engine_;
 
         size_t current_changelog_ = 0;
 
@@ -244,9 +183,37 @@ private:
             return response;
         }
 
-        void apply(const LogRecord& rec) {
-            for (auto op : rec.operations()) {
-                fsm_[op.key()] = op.value();
+        size_t write_num = 0;
+        size_t flush_frequency = 0;
+        DelayedSetter<bool> flush() {
+            engine_.commit();
+            durable_ts_ = next_ts_ - 1;
+            bus::Promise<bool> new_;
+            new_.swap(flush_event_);
+            write_num = 0;
+            return new_;
+        }
+
+        DelayedSetter<bool> account_write() {
+            if (write_num >= flush_frequency == 0) {
+                return flush();
+            } else {
+                return {};
+            }
+        }
+
+        void rollback(const LogRecord& rec) {
+            spdlog::debug("rolling back record with ts={0:d}", rec.ts());
+            for (auto& op : rec.operations()) {
+                engine_.erase(base_key(op.key(), rec.ts()));
+            }
+            engine_.erase(rollback_key(rec.ts()));
+        }
+
+        void write(const LogRecord& rec) {
+            ++write_num;
+            for (auto& op : rec.operations()) {
+                engine_.insert(engine_.copy_str(::base_key(op.key(), rec.ts())), engine_.copy_str(op.value()));
             }
         }
 
@@ -256,13 +223,33 @@ private:
                 ssize_t pos = applied_ts_ - ssize_t(buffered_log_[0].ts()) + 1;
                 if (pos >= 0) {
                     for (; pos < buffered_log_.size() && ts >= buffered_log_[pos].ts(); ++pos) {
-                        apply(buffered_log_[pos]);
                         applied_ts_ = buffered_log_[pos].ts();
+                        for (auto& op : buffered_log_[pos].operations()) {
+                            std::optional<Engine::PersistentStr> prevkey;
+                            engine_.iterate(op.key(), base_key(op.key(), buffered_log_[pos].ts()),
+                                [&] (Engine::PersistentStr key, auto) {
+                                    if (prevkey) {
+                                        engine_.erase({ prevkey->data(), prevkey->size() });
+                                    }
+                                    prevkey = key;
+                                });
+                        }
+                        engine_.erase(rollback_key(buffered_log_[pos].ts()));
                     }
                 }
                 if (old_ts < applied_ts_) {
                     spdlog::debug("advance from {0:d} to {1:d}", old_ts, applied_ts_);
                 }
+
+                // delete records
+                size_t i = 0;
+                while (i < buffered_log_.size() && buffered_log_[i].ts() + applied_backlog <= applied_ts_) {
+                    ++i;
+                }
+                if (i > 0) {
+                    spdlog::debug("erased up to ts={0:d} record", buffered_log_[i - 1].ts());
+                }
+                buffered_log_.erase(buffered_log_.begin(), buffered_log_.begin() + i);
             }
         }
 
@@ -286,8 +273,9 @@ public:
         duration heartbeat_timeout;
         duration heartbeat_interval;
         duration election_timeout;
-        duration rotate_interval;
         duration flush_interval;
+        duration gc_frequency;
+        uint64_t flush_requests;
         std::filesystem::path dir;
 
         size_t rpc_max_batch;
@@ -297,17 +285,22 @@ public:
 
     RaftNode(bus::EndpointManager& manager, Options options)
         : bus::ProtoBus(options.bus_options, manager)
-        , vote_keeper_(options.dir / "vote")
         , buffer_pool_(options.bus_options.tcp_opts.max_message_size)
         , options_(options)
         , elector_([this] { initiate_elections(); }, options.election_timeout)
-        , rotator_([this] { rotate(); }, options.rotate_interval)
-        , flusher_([this] { flush(); }, options.flush_interval)
+        , flusher_([this] { timed_flush(); }, options.flush_interval)
+        , gc_([engine=&state_.get()->engine_] { engine->gc(); }, options.gc_frequency)
         , sender_([this] { heartbeat_to_followers(); }, options.heartbeat_interval)
         , stale_nodes_agent_( [this] { recover_stale_nodes(); }, options.heartbeat_interval)
     {
         {
             auto state = state_.get();
+            state->engine_.reset(options.dir / "db");
+            state->vote_keeper_.reset(state->engine_);
+            state->applied_backlog = options.applied_backlog;
+
+            state->flush_frequency = options_.flush_requests;
+
             assert(options.bus_options.greeter.has_value());
             id_ = *options.bus_options.greeter;
             state->next_timestamps_.assign(options_.members, 0);
@@ -315,7 +308,6 @@ public:
             state->follower_heartbeats_.assign(options_.members, std::chrono::system_clock::time_point::min());
         }
         recover();
-        rotator_.delayed_start();
         flusher_.start();
         using namespace std::placeholders;
         register_handler<VoteRpc, Response>(kVote, [&] (int, VoteRpc rpc) { return bus::make_future(vote(rpc)); });
@@ -341,7 +333,7 @@ private:
         auto state = state_.get();
 
         for (auto& op : s.operations()) {
-            state->fsm_[op.key()] = op.value();
+            state->engine_.insert(state->engine_.copy_str(op.key()), state->engine_.copy_str(op.value()));
         }
 
         if (s.should_set_applied_ts()) {
@@ -367,7 +359,7 @@ private:
             spdlog::info("denied vote for {0:d} their ts={1:d} my ts={2:d} my vote {3:d}", rpc.vote_for(), rpc.ts(), state->durable_ts_, *state->leader_id_);
             return state->create_response(false);
         } else {
-            vote_keeper_.get()->store(rpc);
+            state->vote_keeper_.store(rpc);
             state->leader_id_ = rpc.vote_for();
             spdlog::info("granted vote for {0:d}", rpc.vote_for());
             return state->create_response(true);
@@ -375,6 +367,7 @@ private:
     }
 
     bus::Future<ClientResponse> handle_client_request(int id, ClientRequest req) {
+        DelayedSetter<bool> flush_event;
         bus::Future<bool> commit_future;
         {
             auto state = state_.get();
@@ -401,8 +394,11 @@ private:
                 for (auto op : req.operations()) {
                     if (op.type() == ClientRequest::Operation::READ) {
                         auto entry = response.add_entries();
-                        entry->set_key(op.key());
-                        entry->set_value(state->fsm_[op.key()]);
+                        auto lim = base_key(entry->key(), state->applied_ts_);
+                        state->engine_.iterate(op.key(), lim,
+                            [&] (auto key, auto value) {
+                                entry->set_value(value);
+                            });
                         has_reads = true;
                     }
                     if (op.type() == ClientRequest::Operation::WRITE) {
@@ -418,10 +414,12 @@ private:
                 }
                 rec.set_ts(state->next_ts_++);
                 spdlog::debug("handling client request ts={0:d}", rec.ts());
+                state->write(rec);
                 auto promise = bus::Promise<bool>();
                 state->commit_subscribers_.insert({ rec.ts(), promise });
                 state->buffered_log_.push_back(std::move(rec));
                 sender_.trigger();
+                flush_event = state->account_write();
                 return promise.future().map([response=std::move(response)](bool) { return response; });
             }
         }
@@ -468,7 +466,7 @@ private:
                     self_vote.set_ts(state->durable_ts_);
                     self_vote.set_term(state->current_term_);
                     self_vote.set_vote_for(id_);
-                    vote_keeper_.get()->store(self_vote);
+                    state->vote_keeper_.store(self_vote);
                     state->voted_for_me_.insert(id_);
                 }
                 VoteRpc rpc;
@@ -509,6 +507,7 @@ private:
     }
 
     bus::Future<Response> handle_append_rpcs(int id, AppendRpcs msg) {
+        DelayedSetter<bool> flush_notifier;
         bus::Future<bool> flush_event;
         bool has_new_records = false;
         {
@@ -529,16 +528,16 @@ private:
                 if (rpc.ts() < state->applied_ts_) {
                     continue;
                 }
-                if (state->next_ts_ > rpc.ts()) {
-                    if (state->buffered_log_.size() > 0) {
-                        state->buffered_log_.resize(std::max<ssize_t>(0, rpc.ts() - state->buffered_log_[0].ts() + 1));
-                        state->flushed_index_ = std::min(state->flushed_index_, state->buffered_log_.size());
-                    }
-                    state->next_ts_ = rpc.ts();
-                    state->durable_ts_ = std::min<ssize_t>(state->durable_ts_, rpc.ts() - 1);
+                while (rpc.ts() < state->next_ts_) {
+                    assert(!state->buffered_log_.empty());
+                    state->rollback(state->buffered_log_.back());
+                    state->next_ts_ = state->buffered_log_.back().ts();
+                    state->durable_ts_ = std::min(state->durable_ts_, rpc.ts() - 1);
+                    state->buffered_log_.pop_back();
                     assert(state->applied_ts_ < rpc.ts());
                 }
                 if (rpc.ts() == state->next_ts_) {
+                    state->write(rpc);
                     state->buffered_log_.push_back(rpc);
                     ++state->next_ts_;
                     has_new_records = true;
@@ -549,6 +548,7 @@ private:
             }
             state->advance_to(std::min(msg.applied_ts(), state->durable_ts_));
             flush_event = state->flush_event_.future();
+            flush_notifier = state->account_write();
         }
         if (has_new_records) {
             flusher_.trigger();
@@ -709,166 +709,19 @@ private:
         }
     }
 
-    static constexpr std::string_view changelog_fname_prefix = "changelog.";
-    static constexpr std::string_view snapshot_fname_prefix = "snapshot.";
-
-    std::string changelog_name(size_t number) {
-        std::stringstream ss;
-        ss << changelog_fname_prefix << number;
-        std::filesystem::path path = options_.dir;
-        path /= ss.str();
-        return path.string();
-    }
-
-    std::string snapshot_name(size_t number) {
-        std::stringstream ss;
-        ss << snapshot_fname_prefix << number;
-        std::filesystem::path path = options_.dir;
-        path /= ss.str();
-        return path.string();
-    }
-
-    static std::optional<size_t> parse_name(std::string_view prefix, std::string fname) {
-        if (fname.substr(0, prefix.size()) == prefix) {
-            auto suffix = fname = fname.substr(prefix.size());
-            for (char c : suffix) {
-                if (!isdigit(c)) {
-                    return std::nullopt;
-                }
-            }
-            return std::stoi(suffix);
-        } else {
-            return std::nullopt;
-        }
-    }
-
-    static std::optional<size_t> parse_changelog_name(std::string fname) {
-        return parse_name(changelog_fname_prefix, std::move(fname));
-    }
-
-    static std::optional<size_t> parse_snapshot_name(std::string fname) {
-        return parse_name(snapshot_fname_prefix, std::move(fname));
-    }
-
-    void flush() {
-        std::vector<LogRecord> to_flush;
-        bus::Promise<bool> to_deliver;
-        // we want log records to be consecutive
-        auto log = log_.get();
-        size_t durable_ts;
-
+    void timed_flush() {
+        DelayedSetter<bool> to_deliver;
         {
             auto state = state_.get();
-            auto& log = state->buffered_log_;
-            size_t i = 0;
-            while (i < log.size() && log[i].ts() + options_.applied_backlog <= state->applied_ts_) {
-                ++i;
-            }
-            to_flush.insert(to_flush.begin(), log.begin() + state->flushed_index_, log.end());
-            if (i > 0) {
-                spdlog::debug("erased up to ts={0:d} record", state->buffered_log_[i - 1].ts());
-            }
-            log.erase(log.begin(), log.begin() + i);
-            state->flushed_index_ = log.size();
-            to_deliver.swap(state->flush_event_);
-            durable_ts = !state->buffered_log_.empty() ? state->buffered_log_.back().ts() : state->durable_ts_;
+            to_deliver = state->flush();
         }
 
-        if (to_flush.size()) {
-            spdlog::debug("write from {0:d} to {1:d} to changelog", to_flush[0].ts(), to_flush.back().ts());
-        }
-        for (auto& record : to_flush) {
-            log->write_log_record(record);
-        }
-        log->sync();
-
-        state_.get()->durable_ts_ = durable_ts;
-
-        to_deliver.set_value_once(true);
-    }
-
-    bool read_snapshot(BufferedFile& io, int number, int64_t& ts, std::unordered_map<std::string, std::string>& fsm) {
-        auto fname = snapshot_name(number);
-        io.set_fd(open(fname.c_str(), O_RDONLY));
-        bool valid = true;
-        std::optional<uint64_t> size = io.read_uint64();
-        std::optional<uint64_t> applied = io.read_uint64();
-        if (!size.has_value() || !applied.has_value()) {
-            return false;
-        }
-        ts = *applied;
-        for (uint64_t i = 0; i < *size; ++i) {
-            if (auto record = io.read_log_record()) {
-                for (auto& op : record->operations()) {
-                    fsm[op.key()] = op.value();
-                }
-            } else {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    void iterate_changelog(BufferedFile& io, std::function<void(LogRecord)> consumer) {
-        while (auto rec = io.read_log_record()) {
-            consumer(std::move(*rec));
-        }
-    }
-
-    std::vector<size_t> discover_snapshots() {
-        std::vector<size_t> snapshots;
-        for (auto entry : std::filesystem::directory_iterator(options_.dir)) {
-            if (auto number = parse_snapshot_name(entry.path().filename())) {
-                snapshots.push_back(*number);
-            }
-        }
-        std::sort(snapshots.begin(), snapshots.end());
-        return snapshots;
-    }
-
-    std::vector<size_t> discover_changelogs() {
-        std::vector<size_t> changelogs;
-        for (auto entry : std::filesystem::directory_iterator(options_.dir)) {
-            if (auto number = parse_changelog_name(entry.path().filename())) {
-                changelogs.push_back(*number);
-            }
-        }
-        std::sort(changelogs.begin(), changelogs.end());
-        return changelogs;
+        to_deliver.set();
     }
 
     void recover() {
         auto state = state_.get();
-        std::vector<size_t> snapshots = discover_snapshots();
-        std::vector<size_t> changelogs = discover_changelogs();
-        if (!snapshots.empty()) {
-            state->current_changelog_ = std::max(state->current_changelog_, snapshots.back() + 1);
-        }
-        if (!changelogs.empty()) {
-            state->current_changelog_ = std::max(state->current_changelog_, changelogs.back() + 1);
-        }
 
-        BufferedFile io;
-        while (!snapshots.empty()) {
-            if (read_snapshot(io, snapshots.back(), state->applied_ts_, state->fsm_)) {
-                state->durable_ts_ = state->applied_ts_;
-                state->next_ts_ = state->applied_ts_ + 1;
-                break;
-            } else {
-                snapshots.pop_back();
-                state->fsm_.clear();
-            }
-        }
-
-        size_t first_changelog = 0;
-        for (size_t i = 0; i < changelogs.size(); ++i) {
-            auto fname = changelog_name(changelogs[i]);
-            io.set_fd(open(fname.c_str(), O_RDONLY));
-            auto durable_ts = io.read_uint64();
-            if (durable_ts && *durable_ts < state->applied_ts_) {
-                first_changelog = i;
-            }
-        }
         for (size_t i = first_changelog; i < changelogs.size(); ++i) {
             auto fname = changelog_name(changelogs[i]);
             io.set_fd(open(fname.c_str(), O_RDONLY));
@@ -883,72 +736,23 @@ private:
                     }
                 });
         }
-        {
-            auto log = log_.get();
-            log->set_fd(open(changelog_name(state->current_changelog_).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR));
-            io.write_uint64(state->durable_ts_);
-        }
-        if (auto vote = vote_keeper_.get()->recover()) {
+        if (auto vote = state->vote_keeper_.recover()) {
             state->current_term_ = vote->term();
             state->leader_id_ = vote->vote_for();
         }
         spdlog::info("recovered term={0:d} durable_ts={1:d} applied_ts={2:d}", state->current_term_, state->durable_ts_, state->applied_ts_);
     }
 
-    void rotate() {
-        size_t changelog_number;
-        // sync calls under lock cos don't want to deal with partial states
-        {
-            auto log = log_.get();
-            auto state = state_.get();
-            changelog_number = ++state->current_changelog_;
-            log->set_fd(open(changelog_name(changelog_number).c_str(), O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR));
-            log->write_uint64(state->durable_ts_);
-        }
-        // here we go dumpin'
-        BufferedFile snapshot{open(snapshot_name(changelog_number).c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)};
-        State& unsafe_state_ptr = *state_.get();
-        bus::SharedView preallocated_arena_buf(buffer_pool_, options_.bus_options.tcp_opts.max_message_size);
-        if (pid_t child = fork()) {
-            FATAL(child < 0);
-            int wstatus;
-            pid_t exited = waitpid(child, &wstatus, 0);
-            FATAL(child != exited);
-            FATAL(WEXITSTATUS(wstatus) != 0);
-        } else {
-            State& state = unsafe_state_ptr;
-            snapshot.write_uint64(state.fsm_.size());
-            snapshot.write_uint64(state.applied_ts_);
-            uint64_t applied_ts = state.applied_ts_;
-            for (auto [k, v] : state.fsm_) {
-                google::protobuf::ArenaOptions options;
-                options.initial_block = preallocated_arena_buf.data();
-                options.initial_block_size = preallocated_arena_buf.size();
-                google::protobuf::Arena arena(options);
-                LogRecord* record = google::protobuf::Arena::CreateMessage<LogRecord>(&arena);
-                auto* op = record->add_operations();
-                op->set_key(k);
-                op->set_value(v);
-                snapshot.write_log_record(*record);
-            }
-            snapshot.sync();
-            _exit(0);
-        }
-    }
-
 private:
-    bus::internal::ExclusiveWrapper<VoteKeeper> vote_keeper_;
     bus::BufferPool buffer_pool_;
     Options options_;
     bus::internal::ExclusiveWrapper<State> state_;
 
     bus::internal::PeriodicExecutor elector_;
     bus::internal::PeriodicExecutor flusher_;
-    bus::internal::PeriodicExecutor rotator_;
+    bus::internal::PeriodicExecutor gc_;
     bus::internal::PeriodicExecutor sender_;
     bus::internal::PeriodicExecutor stale_nodes_agent_;
-
-    bus::internal::ExclusiveWrapper<BufferedFile> log_;
 
     uint64_t id_;
 
@@ -985,9 +789,10 @@ int main(int argc, char** argv) {
     options.heartbeat_interval = parse_duration(conf["heartbeat_interval"]);
     options.election_timeout = parse_duration(conf["election_timeout"]);
     options.applied_backlog = conf["applied_backlog"].asUInt64();
-    options.rotate_interval = parse_duration(conf["rotate_interval"]);
     options.flush_interval = parse_duration(conf["flush_interval"]);
     options.rpc_max_batch = conf["rpc_max_batch"].asUInt64();
+    options.flush_requests = conf["flush_req_interval"].asUInt64();
+    options.gc_frequency = parse_duration(conf["gc"]);
     options.members = members.size();
 
     spdlog::set_pattern("[%H:%M:%S.%e] [" + std::to_string(id) + "] [%^%l%$] %v");
