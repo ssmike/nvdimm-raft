@@ -1,7 +1,6 @@
 #pragma once
 
-#include <libpmemobj.h>
-
+#include <libpmemobj++/mutex.hpp>
 #include <libpmemobj++/p.hpp>
 #include <libpmemobj++/persistent_ptr.hpp>
 #include <libpmemobj++/pool.hpp>
@@ -10,6 +9,8 @@
 #include <libpmemobj++/container/string.hpp>
 #include <libpmemobj++/container/vector.hpp>
 
+#include <mutex>
+#include <set>
 #include <string>
 
 class Engine {
@@ -96,7 +97,9 @@ private:
         pmem::obj::persistent_ptr<Page> free_pages = nullptr;
         pmem::obj::persistent_ptr<Page> used_pages = nullptr;
 
-        pmem::obj::vector<pmem::obj::persistent_ptr<KeyNode>> stale_roots_;
+        pmem::obj::mutex lock;
+
+        pmem::obj::persistent_ptr<Page> stale_gc_root_;
         pmem::obj::persistent_ptr<KeyNode> durable_root_ = nullptr;
     };
 
@@ -114,7 +117,8 @@ private:
                     pool_,
                     [&] {
                         root_->free_pages = pmem::obj::make_persistent<Page>();
-                    });
+                    },
+                    root_->lock);
             }
             auto page = root_->free_pages;
             if (page->used & (align - 1)) {
@@ -134,7 +138,8 @@ private:
                         root_->free_pages = page->next;
                         page->next = root_->used_pages;
                         root_->used_pages = page;
-                    });
+                    },
+                    root_->lock);
             }
         }
     }
@@ -174,6 +179,7 @@ private:
     }
 
     void assert_node(KeyNode* node) {
+#ifndef NDEBUG
         for (size_t i = 0; i + 1 < node->key_count; ++i) {
             assert(node->keys[i] < node->keys[i + 1]);
         }
@@ -187,6 +193,7 @@ private:
         }
         prevkey = PersistentStr{};
         traverse(node);
+#endif
     }
 
     InsertResult insert(KeyNode* root, PersistentStr key, PersistentStr value) {
@@ -414,6 +421,24 @@ private:
         return true;
     }
 
+    void visit_str(const PersistentStr& str, std::vector<pmem::obj::persistent_ptr<void>>& collector) {
+        collector.push_back(str.ptr_.raw());
+    }
+
+    void visit_node(pmem::obj::persistent_ptr<KeyNode> node, std::vector<pmem::obj::persistent_ptr<void>>& collector) {
+        if (!node) {
+            return;
+        }
+        for (size_t i = 0; i < node->key_count; ++i) {
+            visit_str(node->keys[i], collector);
+            if (node->is_leaf) {
+                visit_str({ node->children[i].raw() }, collector);
+            } else {
+                visit_node(node->children[i].raw(), collector);
+            }
+        }
+    }
+
 public:
     Engine(std::string fname) {
         if (pmem::obj::pool<Root>::check(fname, layout_) == 1) {
@@ -490,29 +515,58 @@ public:
         }
     }
 
-    void dbgOut(KeyNode* root = nullptr) {
-        if (!root) root = volatile_root_;
-        if (!root) return;
-        for (size_t i = 0; i < root->key_count; ++i) {
-            if (root->is_leaf) {
-                std::cerr << std::string_view{root->keys[i].data(), root->keys[i].size()} << " ";
-            } else {
-                dbgOut(root->child(i).get());
-            }
-        }
-    }
-
     void commit() {
         flush();
         pmem::obj::transaction::run(
             pool_,
             [&] {
-                root_->stale_roots_.push_back(root_->durable_root_);
+                root_->stale_gc_root_ = root_->used_pages;
                 root_->durable_root_ = volatile_root_;
-            });
+            },
+            root_->lock);
     }
 
-    void gc();
+    void gc() {
+        std::vector<pmem::obj::persistent_ptr<void>> visited;
+        pmem::obj::persistent_ptr<KeyNode> durable_root;
+        pmem::obj::persistent_ptr<Page> stale_gc_root;
+        {
+            std::unique_lock lock(root_->lock);
+            durable_root = root_->durable_root_;
+            stale_gc_root = root_->stale_gc_root_;
+        }
+        visit_node(durable_root, visited);
+        std::vector<pmem::obj::persistent_ptr<Page>> pages;
+        for (auto page = stale_gc_root; page; page = page->next) {
+            pages.push_back(page);
+        }
+
+        std::sort(visited.begin(), visited.end());
+        std::sort(pages.begin(), pages.end());
+        std::set<pmem::obj::persistent_ptr<Page>> page_set;
+        size_t visited_pos = 0;
+        for (auto page : pages) {
+            while (visited_pos < visited.size() && visited[visited_pos] < page) {
+                ++visited_pos;
+            }
+            if (visited_pos == visited.size() && visited[visited_pos].raw().off - page.raw().off < sizeof(Page)) {
+                page_set.insert(page);
+            }
+        }
+        pmem::obj::transaction::run(
+            pool_,
+            [&] {
+                for (auto page = stale_gc_root; page && page->next; page = page->next) {
+                    if (page_set.find(page->next) == page_set.end()) {
+                        auto free = page->next;
+                        page->next = page->next->next;
+                        free->next = root_->free_pages;
+                        root_->free_pages = free;
+                    }
+                }
+            },
+            root_->lock);
+    }
 
 private:
     pmem::obj::pool<Root> pool_;
