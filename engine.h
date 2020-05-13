@@ -440,7 +440,13 @@ private:
     }
 
 public:
+    Engine() = default;
+
     Engine(std::string fname) {
+        reset(fname);
+    }
+
+    void reset(std::string fname) {
         if (pmem::obj::pool<Root>::check(fname, layout_) == 1) {
             pool_ = pmem::obj::pool<Root>::open(fname, layout_);
         } else {
@@ -448,6 +454,7 @@ public:
         }
         root_ = pool_.root().get();
         volatile_root_ = root_->durable_root_.get();
+        dirty_pages_.clear();
     }
 
     PersistentStr allocate_str(size_t sz) {
