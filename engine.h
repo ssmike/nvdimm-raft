@@ -29,6 +29,10 @@ public:
                 return 0;
         }
 
+        char operator[](size_t i) const {
+            return data()[i];
+        }
+
         void set_size(uint64_t sz) {
             *reinterpret_cast<uint64_t*>(ptr_.get()) = sz;
         }
@@ -55,6 +59,10 @@ public:
 
         bool operator < (const std::string_view& oth) {
             return std::string_view{data(), size()} < oth;
+        }
+
+        bool operator > (const std::string_view& oth) {
+            return std::string_view{data(), size()} > oth;
         }
 
         bool operator <= (const std::string_view& oth) {
@@ -394,12 +402,12 @@ private:
         }
     }
 
-    template<typename F>
-    bool iterate(KeyNode* root, std::string_view start, std::string_view end, F&& f) {
+    template<typename F, typename Comp>
+    bool iterate(KeyNode* root, Comp&& cmp, F&& f) {
         if (!root) return true;
         if (root->is_leaf) {
             for (size_t i = 0; i < root->key_count; ++i) {
-                if (root->keys[i] >= start && root->keys[i] <= end) {
+                if (cmp(root->keys[i]) == 0) {
                     if (!f(root->keys[i], PersistentStr{root->children[i]})) {
                         return false;
                     }
@@ -407,13 +415,13 @@ private:
             }
         } else {
             for (size_t i = 0; i < root->key_count; ++i) {
-                if (i + 1 < root->key_count && root->keys[i + 1] <= start) {
+                if (i + 1 < root->key_count && cmp(root->keys[i]) < 0 && cmp(root->keys[i + 1]) <= 0) {
                     continue;
                 }
-                if (!(root->keys[i] <= end)) {
+                if (cmp(root->keys[i]) > 0) {
                     break;
                 }
-                if (!iterate((KeyNode*)root->children[i].get(), start, end, std::forward<F>(f))) {
+                if (!iterate((KeyNode*)root->children[i].get(), cmp, std::forward<F>(f))) {
                     return false;
                 }
             }
@@ -486,10 +494,34 @@ public:
 
     template<typename F>
     void iterate(std::string_view start, std::string_view end, F&& f) {
-        iterate(volatile_root_, start, end,
+        iterate(volatile_root_,
+            [&] (PersistentStr str) {
+                if (str < start) return -1;
+                if (str > end) return 1;
+                return 0;
+            },
             [&] (const PersistentStr& key_, const PersistentStr& value_) {
                 return f({key_.data(), key_.size()}, {value_.data(), value_.size()});
             });
+    }
+
+    template<typename F>
+    void iterate_prefix(std::string_view prefix, F&& f) {
+        iterate(f,
+            [&] (PersistentStr str) {
+                size_t i = 0;
+                while (i < prefix.size() && i < str.size() && prefix[i] == str[i]) {
+                    ++i;
+                }
+                if (i == prefix.size()) return 0;
+                if (i == str.size()) return -1;
+                if (prefix[i] < str[i]) {
+                    return 1;
+                } else {
+                    return -1;
+                }
+            },
+            f);
     }
 
     std::optional<std::string_view> lookup(std::string_view key) {
