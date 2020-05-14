@@ -13,7 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS messages.proto client.proto)
 
-add_executable(main main.cpp ${PROTO_HDRS} ${PROTO_SRCS})
+add_executable(main main.cpp engine.h ${PROTO_HDRS} ${PROTO_SRCS})
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONCPP REQUIRED jsoncpp)
@@ -42,11 +42,11 @@ include_directories(
     ${LIBPMEMOBJ++_INCLUDE_DIRECTORIES})
 
 target_link_libraries(main ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES}
-    ${spdlog_LIBRARIES} fmt::fmt bus)
+    ${spdlog_LIBRARIES} ${LIBPMEMOBJ++_LIBRARIES} fmt::fmt bus)
 
 add_executable(client client.cpp ${PROTO_HDRS} ${PROTO_SRCS})
 target_link_libraries(client ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES} bus)
 
-add_executable(testEngine testEngine.cpp ${PROTO_HDRS} ${PROTO_SRCS})
+add_executable(testEngine testEngine.cpp engine.h ${PROTO_HDRS} ${PROTO_SRCS})
 target_link_libraries(testEngine ${Protobuf_LIBRARIES} ${PMEMOBJ_LIBRARIES}
     ${LIBPMEMOBJ++_LIBRARIES})

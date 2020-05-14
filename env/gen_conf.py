@@ -31,6 +31,7 @@ confs = {
         'rotate_interval': 20,
         'applied_backlog': 0,
         'flush_interval': 0.005,
+        'flush_req_inteval': 10,
         'timeout': 2,
         'rpc_max_batch': 10,
         'log': '%d.dir' % (i,)

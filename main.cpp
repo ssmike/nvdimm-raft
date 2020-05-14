@@ -26,6 +26,19 @@
 
 using duration = std::chrono::system_clock::duration;
 
+struct PersistentStrArray {
+    Engine::PersistentStr& operator [](size_t i) {
+        return (reinterpret_cast<Engine::PersistentStr*>(data_))[i];
+    }
+
+    size_t size() const {
+        return size_ / sizeof(Engine::PersistentStr);
+    }
+
+    char* data_;
+    size_t size_;
+};
+
 template<typename T>
 class DelayedSetter {
 public:
@@ -60,22 +73,51 @@ namespace {
         str.resize(sizeof(id));
         for (ssize_t i = sizeof(id) - 1; i >= 0; --i) {
             str[i] = id & 255;
+            id /= 256;
         }
         return str;
     }
 
-    std::string rollback_key(uint64_t id) {
-        return "_rollback" + ts_to_str(id);
+    uint64_t str_to_ts(std::string_view v) {
+        uint64_t res = 0;
+        for (size_t i = 0; i < sizeof(res); ++i) {
+            res *= 256;
+            res += (unsigned char)v[i];
+        }
+        return res;
     }
 
-    std::string rollback_start_key() {
-        return "_rollback";
+    std::string rollback_key(uint64_t id) {
+        return "_" + ts_to_str(id);
+    }
+
+    std::string durable_ts_key() {
+        return "_durable";
+    }
+    std::string applied_ts_key() {
+        return "_applied";
     }
 
     std::string base_key(std::string key, int64_t ts) {
-        key += "_";
+        key += '_';
         key += std::string_view((char*)&ts, sizeof(ts));
         return key;
+    }
+
+    std::string_view from_base_key(std::string_view key) {
+        size_t i = 0;
+        while (i < key.size() && key[i] != '_') {
+            ++i;
+        }
+        return key.substr(0, i);
+    }
+
+    uint64_t ts_from_base_key(std::string_view key) {
+        size_t i = 0;
+        while (i < key.size() && key[i] != '_') {
+            ++i;
+        }
+        return str_to_ts(key.substr(i + 1, sizeof(uint64_t)));
     }
 
     bool reserved_key(std::string_view key) {
@@ -186,9 +228,20 @@ private:
         size_t write_num = 0;
         size_t flush_frequency = 0;
         DelayedSetter<bool> flush() {
-            engine_.commit();
             durable_ts_ = next_ts_ - 1;
+            if (durable_ts_ >= 0) {
+                engine_.insert(engine_.copy_str(durable_ts_key()), engine_.copy_str(ts_to_str(durable_ts_)));
+            }
+            engine_.commit();
+            if (role_ == kLeader) {
+                advance_applied_timestamp();
+            }
             bus::Promise<bool> new_;
+            new_.future().subscribe([subs=pick_subscribers()] (auto&) mutable {
+                    for (auto& sub : subs) {
+                        sub.set_value_once(true);
+                    }
+                });
             new_.swap(flush_event_);
             write_num = 0;
             return new_;
@@ -212,9 +265,20 @@ private:
 
         void write(const LogRecord& rec) {
             ++write_num;
+            Engine::PersistentStr rollback_record = engine_.allocate_str(rec.operations_size() * sizeof(Engine::PersistentStr));
+            assert(rec.ts() >= 0);
+            uint64_t ts = rec.ts();
+            memcpy(rollback_record.data(), &ts, sizeof(ts));
+            size_t i = 0;
             for (auto& op : rec.operations()) {
-                engine_.insert(engine_.copy_str(::base_key(op.key(), rec.ts())), engine_.copy_str(op.value()));
+                auto _key = engine_.copy_str(::base_key(op.key(), rec.ts()));
+                engine_.insert(_key, engine_.copy_str(op.value()));
+                ++i;
+                size_t offset = sizeof(Engine::PersistentStr) * (i++);
+                assert(offset + sizeof(Engine::PersistentStr) <= rollback_record.size());
+                memcpy(rollback_record.data() + offset, &_key, sizeof(Engine::PersistentStr));
             }
+            engine_.insert(engine_.copy_str(rollback_key(rec.ts())), rollback_record);
         }
 
         void advance_to(int64_t ts) {
@@ -225,11 +289,11 @@ private:
                     for (; pos < buffered_log_.size() && ts >= buffered_log_[pos].ts(); ++pos) {
                         applied_ts_ = buffered_log_[pos].ts();
                         for (auto& op : buffered_log_[pos].operations()) {
-                            std::optional<Engine::PersistentStr> prevkey;
+                            std::optional<std::string_view> prevkey;
                             engine_.iterate(op.key(), base_key(op.key(), buffered_log_[pos].ts()),
-                                [&] (Engine::PersistentStr key, auto) {
+                                [&] (std::string_view key, auto) {
                                     if (prevkey) {
-                                        engine_.erase({ prevkey->data(), prevkey->size() });
+                                        engine_.erase(*prevkey);
                                     }
                                     prevkey = key;
                                 });
@@ -239,6 +303,7 @@ private:
                 }
                 if (old_ts < applied_ts_) {
                     spdlog::debug("advance from {0:d} to {1:d}", old_ts, applied_ts_);
+                    engine_.insert(engine_.copy_str(applied_ts_key()), engine_.copy_str(ts_to_str(applied_ts_)));
                 }
 
                 // delete records
@@ -253,7 +318,18 @@ private:
             }
         }
 
-        void advance_applied_timestmap() {
+        std::vector<bus::Promise<bool>> pick_subscribers() {
+            if (role_ != kLeader) return {};
+            std::vector<bus::Promise<bool>> subscribers;
+            while (!commit_subscribers_.empty() && commit_subscribers_.begin()->first <= applied_ts_) {
+                spdlog::debug("fire commit subscriber for ts={0:d}", commit_subscribers_.begin()->first);
+                subscribers.push_back(commit_subscribers_.begin()->second);
+                commit_subscribers_.erase(commit_subscribers_.begin());
+            }
+            return subscribers;
+        }
+
+        void advance_applied_timestamp() {
             durable_timestamps_[id_] = durable_ts_;
             std::vector<int64_t> tss;
             for (auto ts : durable_timestamps_) {
@@ -307,6 +383,7 @@ public:
             state->durable_timestamps_.assign(options_.members, -1);
             state->follower_heartbeats_.assign(options_.members, std::chrono::system_clock::time_point::min());
         }
+        gc_.delayed_start();
         recover();
         flusher_.start();
         using namespace std::placeholders;
@@ -337,6 +414,7 @@ private:
         }
 
         if (s.should_set_applied_ts()) {
+            state->engine_.commit();
             state->applied_ts_ = s.applied_ts();
             state->durable_ts_ = std::max(state->durable_ts_, state->applied_ts_);
             state->next_ts_ = state->durable_ts_ + 1;
@@ -397,7 +475,7 @@ private:
                         auto lim = base_key(entry->key(), state->applied_ts_);
                         state->engine_.iterate(op.key(), lim,
                             [&] (auto key, auto value) {
-                                entry->set_value(value);
+                                entry->set_value(std::string(value));
                             });
                         has_reads = true;
                     }
@@ -495,7 +573,8 @@ private:
                                 state->voted_for_me_.insert(id);
                                 if (state->voted_for_me_.size() > options_.members / 2) {
                                     state->role_ = kLeader;
-                                    state->advance_applied_timestmap();
+                                    state->commit_subscribers_.clear();
+                                    state->advance_applied_timestamp();
                                     spdlog::info("becoming leader applied up to {0:d}", state->applied_ts_);
                                     state->durable_timestamps_.assign(options_.members, state->applied_ts_);
                                     state->next_timestamps_.assign(options_.members, state->applied_ts_ + 1);
@@ -571,73 +650,36 @@ private:
             }
         }
 
-        BufferedFile io;
-
         auto recover_node = [&](size_t node, int64_t next) {
-            uint64_t snapshot_ts = 0;
             spdlog::info("starting recovery for {0:d} ts={1:d}", node, next);
-            auto snapshots = discover_snapshots();
             std::unordered_map<std::string, std::string> fsm;
-            while (!snapshots.empty()) {
-                int64_t ts;
-                if (read_snapshot(io, snapshots.back(), ts, fsm)) {
-                    if (next <= ts) {
-                        spdlog::info("sending snapshot for ts={0:d} to {1:d}", ts, node);
-                        RecoverySnapshot rec;
-                        for (auto item : fsm) {
-                            auto op = rec.add_operations();
-                            op->set_key(item.first);
-                            op->set_value(item.second);
-                            if (rec.operations_size() >= options_.rpc_max_batch) {
-                                if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
-                                    return;
-                                }
-                                rec.Clear();
-                            }
-                        }
-                        rec.set_applied_ts(ts);
-                        rec.set_should_set_applied_ts(true);
+            int64_t applied_ts = -1;
+            auto root = state_.get()->engine_.root();
+            if (auto serialized = root.lookup(applied_ts_key())) {
+                applied_ts = str_to_ts(*serialized);
+            }
+            spdlog::info("snapshot ts={0:d} for node={1:d}", applied_ts, node);
+            RecoverySnapshot rec;
+            root.iterate([&] (std::string_view key, std::string_view value) {
+                    auto op = rec.add_operations();
+                    op->set_key(std::string(key));
+                    op->set_value(std::string(value));
+                    if (rec.operations_size() >= options_.rpc_max_batch) {
                         if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
                             return;
                         }
-                        next = ts + 1;
-                        break;
+                        rec.Clear();
                     }
-                } else {
-                    snapshots.pop_back();
-                }
+                });
+            if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
+                return;
             }
-            spdlog::info("replaying logs for {0:d} from ts={1:d}", node, next);
-            auto changelogs = discover_changelogs();
-            std::vector<LogRecord> records;
-            for (size_t changelog : changelogs) {
-                io.set_fd(open(changelog_name(changelog).c_str(), O_RDONLY));
-                if (auto ts = io.read_uint64()) {
-                    if (ts < next) {
-                        return;
-                    }
-                    iterate_changelog(io, [&](LogRecord rec) {
-                            records.resize(std::max<size_t>(records.size(), rec.ts() + 1));
-                            records[rec.ts() - next - 1] = std::move(rec);
-                        });
-                }
+            if (auto serialized = root.lookup(durable_ts_key())) {
+                next = std::max<int64_t>(next, applied_ts + 1);
             }
-            for (size_t i = 0; i < records.size(); i += options_.rpc_max_batch) {
-                size_t start = i;
-                size_t end = std::min<size_t>(start + options_.rpc_max_batch, records.size());
-                AppendRpcs rpc;
-                {
-                    auto state = state_.get();
-                    rpc.set_term(state->current_term_);
-                    if (state->role_ != kLeader) {
-                        return;
-                    }
-                }
-                spdlog::debug("sending changelogs from {0:d} to {1:d}", records[start].ts(), records[end - 1].ts());
-                for (size_t j = start; j < end; ++j) {
-                    *rpc.add_records() = std::move(records[j]);
-                }
-                send<AppendRpcs, Response>(std::move(rpc), node, kAppendRpcs, options_.heartbeat_timeout).wait();
+            {
+                auto state = state_.get();
+                state->next_timestamps_[node] = std::max(state->next_timestamps_[node], next);
             }
         };
 
@@ -692,12 +734,8 @@ private:
                                 if (to_log) {
                                     spdlog::debug("node {2:d} responded with next_ts={0:d} durable_ts={1:d}", response.next_ts(), response.durable_ts(), id);
                                 }
-                                state->advance_applied_timestmap();
-                                while (!state->commit_subscribers_.empty() && state->commit_subscribers_.begin()->first <= state->applied_ts_) {
-                                    spdlog::debug("fire commit subscriber for ts={0:d}", state->commit_subscribers_.begin()->first);
-                                    subscribers.push_back(state->commit_subscribers_.begin()->second);
-                                    state->commit_subscribers_.erase(state->commit_subscribers_.begin());
-                                }
+                                state->advance_applied_timestamp();
+                                subscribers = state->pick_subscribers();
                             } else {
                                 spdlog::debug("node {0:d} failed heartbeat", id);
                             }
@@ -722,19 +760,25 @@ private:
     void recover() {
         auto state = state_.get();
 
-        for (size_t i = first_changelog; i < changelogs.size(); ++i) {
-            auto fname = changelog_name(changelogs[i]);
-            io.set_fd(open(fname.c_str(), O_RDONLY));
-            if (!io.read_uint64()) continue;
-            iterate_changelog(io,
-                [&](auto rec) {
-                    if (rec.ts() > state->applied_ts_) {
-                        state->buffered_log_.resize(std::max<size_t>(state->buffered_log_.size(), rec.ts() - state->applied_ts_));
-                        state->buffered_log_[rec.ts() - state->applied_ts_ - 1] = rec;
-                        state->next_ts_ = std::max<size_t>(state->next_ts_, rec.ts() + 1);
-                        state->durable_ts_ = std::max<ssize_t>(state->durable_ts_, rec.ts());
-                    }
-                });
+        if (auto serialized = state->engine_.lookup(durable_ts_key())) {
+            state->durable_ts_ = str_to_ts(*serialized);
+        }
+        if (auto serialized = state->engine_.lookup(applied_ts_key())) {
+            state->applied_ts_ = str_to_ts(*serialized);
+        }
+        for (ssize_t i = state->applied_ts_ + 1; i < state->durable_ts_; ++i) {
+            auto record = state->engine_.lookup(rollback_key(i));
+            assert(record);
+            PersistentStrArray array{const_cast<char*>(record->data()), record->size()};
+            state->buffered_log_.emplace_back();
+            for (size_t j = 0; j < array.size(); ++j) {
+                auto op = state->buffered_log_.back().add_operations();
+                auto key = ::from_base_key({ array[j].data(), array[j].size() });
+                op->set_key(std::string(key));
+                auto value = state->engine_.lookup({ array[j].data(), array[j].size() });
+                assert(value);
+                op->set_value(std::string(*value));
+            }
         }
         if (auto vote = state->vote_keeper_.recover()) {
             state->current_term_ = vote->term();

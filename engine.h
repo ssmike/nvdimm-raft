@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <list>
 
 class Engine {
 public:
@@ -439,6 +440,85 @@ private:
     }
 
 public:
+    class RootHolder {
+    public:
+        RootHolder(KeyNode* root, std::function<void()> deleter, Engine& parent)
+            : root_(root)
+            , deleter_(deleter)
+            , parent_(parent)
+        {
+        }
+
+        RootHolder(const RootHolder&) = delete;
+
+        template<typename F>
+        void iterate(F&& f) {
+            parent_.iterate(root_,
+                [](auto) { return 0; },
+                [&] (const PersistentStr& key_, const PersistentStr& value_) {
+                    f({key_.data(), key_.size()}, {value_.data(), value_.size()});
+                    return true;
+                });
+        }
+
+        std::optional<std::string_view> lookup(std::string_view key) {
+            return parent_.lookup(root_, key);
+        }
+
+        ~RootHolder() {
+            if (deleter_) {
+                deleter_();
+            }
+        }
+
+    private:
+        KeyNode* root_ = nullptr;
+        std::function<void()> deleter_;
+        Engine& parent_;
+    };
+
+    RootHolder root() {
+        std::unique_lock lock(root_->lock);
+        auto iterator = gc_pinned_nodes_.insert(gc_pinned_nodes_.end(), volatile_root_);
+        return RootHolder{
+            volatile_root_,
+            [=] {
+                std::unique_lock lock(root_->lock);
+                gc_pinned_nodes_.erase(iterator);
+            },
+            *this
+        };
+    }
+
+    std::optional<std::string_view> lookup(KeyNode* root, std::string_view key) {
+        std::optional<std::string_view> result;
+        iterate(root, key, key,
+            [&] (std::string_view key_, std::string_view value_) {
+                if (key == key_) {
+                    result = value_;
+                    return false;
+                } else {
+                    return true;
+                }
+            });
+        return result;
+    }
+
+    template<typename F>
+    void iterate(KeyNode* root, std::string_view start, std::string_view end, F&& f) {
+        iterate(root,
+            [&] (PersistentStr str) {
+                if (str < start) return -1;
+                if (str > end) return 1;
+                return 0;
+            },
+            [&] (const PersistentStr& key_, const PersistentStr& value_) {
+                f(std::string_view{key_.data(), key_.size()}, std::string_view{value_.data(), value_.size()});
+                return true;
+            });
+    }
+
+public:
     Engine() = default;
 
     Engine(std::string fname) {
@@ -485,48 +565,11 @@ public:
 
     template<typename F>
     void iterate(std::string_view start, std::string_view end, F&& f) {
-        iterate(volatile_root_,
-            [&] (PersistentStr str) {
-                if (str < start) return -1;
-                if (str > end) return 1;
-                return 0;
-            },
-            [&] (const PersistentStr& key_, const PersistentStr& value_) {
-                return f({key_.data(), key_.size()}, {value_.data(), value_.size()});
-            });
-    }
-
-    template<typename F>
-    void iterate_prefix(std::string_view prefix, F&& f) {
-        iterate(f,
-            [&] (PersistentStr str) {
-                size_t i = 0;
-                while (i < prefix.size() && i < str.size() && prefix[i] == str[i]) {
-                    ++i;
-                }
-                if (i == prefix.size()) return 0;
-                if (i == str.size()) return -1;
-                if (prefix[i] < str[i]) {
-                    return 1;
-                } else {
-                    return -1;
-                }
-            },
-            f);
+        iterate(volatile_root_, start, end, std::forward<F>(f));
     }
 
     std::optional<std::string_view> lookup(std::string_view key) {
-        std::optional<std::string_view> result;
-        iterate(key, key,
-            [&] (std::string_view key_, std::string_view value_) {
-                if (key == key_) {
-                    result = value_;
-                    return false;
-                } else {
-                    return true;
-                }
-            });
-        return result;
+        return lookup(volatile_root_, key);
     }
 
     void erase(std::string_view key) {
@@ -575,14 +618,20 @@ public:
 
     void gc() {
         std::vector<pmem::obj::persistent_ptr<void>> visited;
-        pmem::obj::persistent_ptr<KeyNode> durable_root;
         pmem::obj::persistent_ptr<Page> stale_gc_root;
+        std::vector<pmem::obj::persistent_ptr<KeyNode>> pinned;
+        pinned.reserve(10);
         {
             std::unique_lock lock(root_->lock);
-            durable_root = root_->durable_root_;
+            pinned.push_back(root_->durable_root_.get());
+            for (auto node : gc_pinned_nodes_) {
+                pinned.push_back(node);
+            }
             stale_gc_root = root_->stale_gc_root_;
         }
-        visit_node(durable_root, visited);
+        for (auto node : pinned) {
+            visit_node(node, visited);
+        }
         std::vector<pmem::obj::persistent_ptr<Page>> pages;
         for (auto page = stale_gc_root; page; page = page->next) {
             pages.push_back(page);
@@ -611,13 +660,13 @@ public:
                         root_->free_pages = free;
                     }
                 }
-            },
-            root_->lock);
+            });
     }
 
 private:
     pmem::obj::pool<Root> pool_;
     Root* root_;
+    std::list<pmem::obj::persistent_ptr<KeyNode>> gc_pinned_nodes_;
 
     const std::string layout_ = "kv_engine";
     std::vector<DirtyPage> dirty_pages_;
