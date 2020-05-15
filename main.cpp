@@ -121,6 +121,14 @@ namespace {
     }
 
     bool reserved_key(std::string_view key) {
+        return (key.size() > 0 && key[0] == '_');
+    }
+
+    // allowed client keys
+    bool allowed_key(std::string_view key) {
+        if (key.size() == 0) {
+            return false;
+        }
         for (size_t i = 0; i < key.size(); ++i) {
             if (key[i] == '_') {
                 return true;
@@ -470,6 +478,10 @@ private:
                 bool has_reads = false;
                 response.set_success(true);
                 for (auto op : req.operations()) {
+                    if (allowed_key(op.key())) {
+                        response.set_success(false);
+                        return bus::make_future(std::move(response));
+                    }
                     if (op.type() == ClientRequest::Operation::READ) {
                         auto entry = response.add_entries();
                         auto lim = base_key(entry->key(), state->applied_ts_);
@@ -662,6 +674,9 @@ private:
             RecoverySnapshot rec;
             root.iterate([&] (std::string_view key, std::string_view value) {
                     auto op = rec.add_operations();
+                    if (reserved_key(key) || ts_from_base_key(key) > applied_ts) {
+                        return;
+                    }
                     op->set_key(std::string(key));
                     op->set_value(std::string(value));
                     if (rec.operations_size() >= options_.rpc_max_batch) {
