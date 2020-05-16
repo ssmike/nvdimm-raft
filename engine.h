@@ -521,15 +521,16 @@ public:
 public:
     Engine() = default;
 
-    Engine(std::string fname) {
-        reset(fname);
+    template<typename... Args>
+    Engine(Args&&... args) {
+        reset(std::forward<Args>(args)...);
     }
 
-    void reset(std::string fname) {
+    void reset(std::string fname, size_t pool_size=PMEMOBJ_MIN_POOL, mode_t mode=S_IWUSR | S_IRUSR) {
         if (pmem::obj::pool<Root>::check(fname, layout_) == 1) {
             pool_ = pmem::obj::pool<Root>::open(fname, layout_);
         } else {
-            pool_ = pmem::obj::pool<Root>::create(fname, layout_);
+            pool_ = pmem::obj::pool<Root>::create(fname, layout_, pool_size, mode);
         }
         root_ = pool_.root().get();
         volatile_root_ = root_->durable_root_.get();
