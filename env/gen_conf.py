@@ -20,6 +20,8 @@ confs = {
         'id': i,
         'port': port(i),
         'pool_size': 3,
+        'db_pool_size': 100,
+        'gc': 0.001,
         'max_message': 8192,
         'members': [
             {'host': 'localhost', 'port': port(i)}

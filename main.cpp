@@ -48,9 +48,15 @@ public:
     }
 
     DelayedSetter(const DelayedSetter<T>&) = default;
-    DelayedSetter(DelayedSetter<T>&&) = default;
+    DelayedSetter(DelayedSetter<T>&& oth) {
+        promise_.swap(oth.promise_);
+    }
+
     DelayedSetter<T>& operator = (const DelayedSetter<T>&) = default;
-    DelayedSetter<T>& operator = (DelayedSetter<T>&&) = default;
+    DelayedSetter<T>& operator = (DelayedSetter<T>&& oth) {
+        promise_.swap(oth.promise_);
+        return *this;
+    }
 
     void set() {
         if (promise_) {
@@ -64,7 +70,7 @@ public:
     }
 
 private:
-    std::optional<bus::Promise<T>> promise_;
+    std::optional<bus::Promise<T>> promise_ = std::nullopt;
 };
 
 namespace {
@@ -362,6 +368,8 @@ public:
         uint64_t flush_requests;
         std::filesystem::path dir;
 
+        size_t pool_size;
+
         size_t rpc_max_batch;
         size_t members;
         ssize_t applied_backlog;
@@ -379,7 +387,7 @@ public:
     {
         {
             auto state = state_.get();
-            state->engine_.reset(options.dir / "db");
+            state->engine_.reset(options.dir / "db", options_.pool_size);
             state->vote_keeper_.reset(state->engine_);
             state->applied_backlog = options.applied_backlog;
 
@@ -853,6 +861,7 @@ int main(int argc, char** argv) {
     options.rpc_max_batch = conf["rpc_max_batch"].asUInt64();
     options.flush_requests = conf["flush_req_interval"].asUInt64();
     options.gc_frequency = parse_duration(conf["gc"]);
+    options.pool_size = conf["db_pool_size"].asUInt64() * 1024 * 1024;
     options.members = members.size();
 
     spdlog::set_pattern("[%H:%M:%S.%e] [" + std::to_string(id) + "] [%^%l%$] %v");
