@@ -100,7 +100,7 @@ namespace {
 
     std::string base_key(std::string key, int64_t ts) {
         key += '_';
-        key += std::string_view((char*)&ts, sizeof(ts));
+        key += ts_to_str(ts);
         return key;
     }
 
@@ -131,10 +131,10 @@ namespace {
         }
         for (size_t i = 0; i < key.size(); ++i) {
             if (key[i] == '_') {
-                return true;
+                return false;
             }
         }
-        return false;
+        return true;
     }
 }
 
@@ -386,7 +386,7 @@ public:
             state->flush_frequency = options_.flush_requests;
 
             assert(options.bus_options.greeter.has_value());
-            id_ = *options.bus_options.greeter;
+            state->id_ = id_ = *options.bus_options.greeter;
             state->next_timestamps_.assign(options_.members, 0);
             state->durable_timestamps_.assign(options_.members, -1);
             state->follower_heartbeats_.assign(options_.members, std::chrono::system_clock::time_point::min());
@@ -831,6 +831,7 @@ int main(int argc, char** argv) {
     options.bus_options.batch_opts.max_batch = conf["max_batch"].asInt();
     options.bus_options.batch_opts.max_delay = parse_duration(conf["max_delay"]);
     size_t id = conf["id"].asInt();
+    srand(id);
     options.bus_options.greeter = id;
     options.bus_options.tcp_opts.port = conf["port"].asInt();
     options.bus_options.tcp_opts.fixed_pool_size = conf["pool_size"].asUInt64();
