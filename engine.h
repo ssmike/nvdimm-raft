@@ -217,6 +217,16 @@ private:
                 while (pos < root->key_count && root->keys[pos] < key) {
                     ++pos;
                 }
+
+                // insert() == replace()
+                if (pos < root->key_count && root->keys[pos] == key) {
+                    auto result = allocate<KeyNode>();
+                    *result = *root;
+                    result->children[pos] = value.ptr_;
+                    return InsertResult{ .left = result, .right = nullptr };
+                }
+                //
+
                 insert_key = key;
                 insert_value = value.ptr_;
                 new_root = *root;

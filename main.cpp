@@ -287,7 +287,6 @@ private:
             for (auto& op : rec.operations()) {
                 auto _key = engine_.copy_str(::base_key(op.key(), rec.ts()));
                 engine_.insert(_key, engine_.copy_str(op.value()));
-                ++i;
                 size_t offset = sizeof(Engine::PersistentStr) * (i++);
                 assert(offset + sizeof(Engine::PersistentStr) <= rollback_record.size());
                 memcpy(rollback_record.data() + offset, &_key, sizeof(Engine::PersistentStr));
@@ -425,15 +424,28 @@ private:
     void handle_recovery_snapshot(RecoverySnapshot s) {
         auto state = state_.get();
 
+        if (state->role_ != kFollower || s.applied_ts() <= state->applied_ts_) {
+            return;
+        }
+
         for (auto& op : s.operations()) {
             state->engine_.insert(state->engine_.copy_str(op.key()), state->engine_.copy_str(op.value()));
         }
 
         if (s.should_set_applied_ts()) {
-            state->engine_.commit();
             state->applied_ts_ = s.applied_ts();
             state->durable_ts_ = std::max(state->durable_ts_, state->applied_ts_);
             state->next_ts_ = state->durable_ts_ + 1;
+            state->engine_.insert(
+                state->engine_.copy_str(durable_ts_key()),
+                state->engine_.copy_str(ts_to_str(state->durable_ts_)));
+            state->engine_.insert(state->engine_.copy_str(applied_ts_key()), state->engine_.copy_str(ts_to_str(s.applied_ts())));
+            state->engine_.iterate(rollback_key(0), rollback_key(state->applied_ts_),
+                [&] (auto key, auto value) {
+                    state->engine_.erase(key);
+                });
+            state->engine_.commit();
+            spdlog::debug("set applied_ts={0:d}", s.applied_ts());
         }
     }
 
@@ -486,13 +498,13 @@ private:
                 bool has_reads = false;
                 response.set_success(true);
                 for (auto op : req.operations()) {
-                    if (allowed_key(op.key())) {
+                    if (!allowed_key(op.key())) {
                         response.set_success(false);
                         return bus::make_future(std::move(response));
                     }
                     if (op.type() == ClientRequest::Operation::READ) {
                         auto entry = response.add_entries();
-                        auto lim = base_key(entry->key(), state->applied_ts_);
+                        auto lim = base_key(op.key(), state->applied_ts_);
                         state->engine_.iterate(op.key(), lim,
                             [&] (auto key, auto value) {
                                 entry->set_value(std::string(value));
@@ -664,7 +676,7 @@ private:
                 if (id_ != id) {
                     if (state->next_timestamps_[id] < ts) {
                         nodes.push_back(id);
-                        nexts.push_back(id);
+                        nexts.push_back(state->next_timestamps_[id]);
                     }
                 }
             }
@@ -678,13 +690,14 @@ private:
             if (auto serialized = root.lookup(applied_ts_key())) {
                 applied_ts = str_to_ts(*serialized);
             }
-            spdlog::info("snapshot ts={0:d} for node={1:d}", applied_ts, node);
+            spdlog::info("sending snapshot ts={0:d} for node={1:d}", applied_ts, node);
             RecoverySnapshot rec;
+            rec.set_applied_ts(applied_ts);
             root.iterate([&] (std::string_view key, std::string_view value) {
-                    auto op = rec.add_operations();
                     if (reserved_key(key) || ts_from_base_key(key) > applied_ts) {
                         return;
                     }
+                    auto op = rec.add_operations();
                     op->set_key(std::string(key));
                     op->set_value(std::string(value));
                     if (rec.operations_size() >= options_.rpc_max_batch) {
@@ -692,14 +705,17 @@ private:
                             return;
                         }
                         rec.Clear();
+                        rec.set_applied_ts(applied_ts);
                     }
                 });
+            rec.set_should_set_applied_ts(true);
             if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
                 return;
             }
             if (auto serialized = root.lookup(durable_ts_key())) {
                 next = std::max<int64_t>(next, applied_ts + 1);
             }
+            spdlog::info("successful recovery node={0:d} next_ts={1:d}", node, next);
             {
                 auto state = state_.get();
                 state->next_timestamps_[node] = std::max(state->next_timestamps_[node], next);

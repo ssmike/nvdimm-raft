@@ -27,16 +27,16 @@ confs = {
             {'host': 'localhost', 'port': port(i)}
             for i in nodes
         ],
-        'heartbeat_interval': 0.3,
-        'heartbeat_timeout': 0.01,
-        'election_timeout': 4,
-        'rotate_interval': 20,
+        'heartbeat_interval': 1,
+        'heartbeat_timeout': 0.4,
+        'election_timeout': 10,
+        'rotate_interval': 200,
         'applied_backlog': 0,
-        'flush_interval': 0.005,
+        'flush_interval': 0.05,
         'flush_req_inteval': 10,
         'timeout': 2,
         'rpc_max_batch': 10,
-        'log': '%d.dir' % (i,)
+        'log': os.path.join('storage', '%d.dir' % (i,))
     }
     for i in nodes
 }
