@@ -656,7 +656,7 @@ public:
             while (visited_pos < visited.size() && visited[visited_pos] < page) {
                 ++visited_pos;
             }
-            if (visited_pos == visited.size() && visited[visited_pos].raw().off - page.raw().off < sizeof(Page)) {
+            if (visited_pos < visited.size() && visited[visited_pos].raw().off - page.raw().off < sizeof(Page)) {
                 page_set.insert(page);
             }
         }
