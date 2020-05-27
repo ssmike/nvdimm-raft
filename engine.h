@@ -491,7 +491,7 @@ public:
         std::unique_lock lock(root_->lock);
         auto iterator = gc_pinned_nodes_.insert(gc_pinned_nodes_.end(), volatile_root_);
         return RootHolder{
-            volatile_root_,
+            root_->durable_root_.get(),
             [=] {
                 std::unique_lock lock(root_->lock);
                 gc_pinned_nodes_.erase(iterator);

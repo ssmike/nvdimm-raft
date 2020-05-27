@@ -1,4 +1,4 @@
-syntax = "proto3";
+syntax = "proto2";
 
 // mixed reads & writes are not supported
 message ClientRequest {
@@ -7,21 +7,21 @@ message ClientRequest {
             READ = 0;
             WRITE = 1;
         }
-        Type type = 1;
-        bytes key = 2;
-        bytes value = 3;
+        optional Type type = 1;
+        optional bytes key = 2;
+        optional bytes value = 3;
     };
     repeated Operation operations = 1;
 };
 
 message ClientResponse {
-    bool success = 1;
-    bool should_retry = 4;
-    uint64 retry_to = 2;
+    optional bool success = 1;
+    optional bool should_retry = 4;
+    optional uint64 retry_to = 2;
 
     message Entry {
-        bytes key = 1;
-        bytes value = 2;
+        optional bytes key = 1;
+        optional bytes value = 2;
     }
     repeated Entry entries = 3;
 }

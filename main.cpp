@@ -406,8 +406,9 @@ public:
         register_handler<AppendRpcs, Response>(kAppendRpcs, std::bind(&RaftNode::handle_append_rpcs, this, _1, _2));
         register_handler<ClientRequest, ClientResponse>(kClientReq, std::bind(&RaftNode::handle_client_request, this, _1, _2));
         register_handler<RecoverySnapshot, Response>(kRecover, [&](int, RecoverySnapshot s) {
-            handle_recovery_snapshot(std::move(s));
-            return bus::make_future(Response());
+            Response r;
+            r.set_success(handle_recovery_snapshot(std::move(s)));
+            return bus::make_future(std::move(r));
         });
         sender_.delayed_start();
         elector_.delayed_start();
@@ -421,11 +422,12 @@ public:
     }
 
 private:
-    void handle_recovery_snapshot(RecoverySnapshot s) {
+    bool handle_recovery_snapshot(RecoverySnapshot s) {
         auto state = state_.get();
 
         if (state->role_ != kFollower || s.applied_ts() <= state->applied_ts_) {
-            return;
+            spdlog::debug("denied recover request with ts={0:d}", s.applied_ts());
+            return false;
         }
 
         for (auto& op : s.operations()) {
@@ -447,6 +449,7 @@ private:
             state->engine_.commit();
             spdlog::debug("set applied_ts={0:d}", s.applied_ts());
         }
+        return true;
     }
 
     Response vote(VoteRpc rpc) {
@@ -629,6 +632,7 @@ private:
             if (msg.term() > state->current_term_) {
                 spdlog::info("stale term becoming follower");
                 state->current_term_ = msg.term();
+                state->role_ = kFollower;
             }
             assert(state->role_ != kLeader);
             state->role_ = kFollower;
@@ -636,7 +640,7 @@ private:
             state->leader_id_ = id;
 
             for (auto& rpc : msg.records()) {
-                if (rpc.ts() < state->applied_ts_) {
+                if (rpc.ts() <= state->applied_ts_) {
                     continue;
                 }
                 while (rpc.ts() < state->next_ts_) {
@@ -645,7 +649,6 @@ private:
                     state->next_ts_ = state->buffered_log_.back().ts();
                     state->durable_ts_ = std::min(state->durable_ts_, rpc.ts() - 1);
                     state->buffered_log_.pop_back();
-                    assert(state->applied_ts_ < rpc.ts());
                 }
                 if (rpc.ts() == state->next_ts_) {
                     state->write(rpc);
@@ -677,6 +680,7 @@ private:
                     if (state->next_timestamps_[id] < ts) {
                         nodes.push_back(id);
                         nexts.push_back(state->next_timestamps_[id]);
+                        spdlog::info("should recover {0:d} with next_ts={1:d}. my applied_ts={2:d}", id, state->next_timestamps_[id], state->applied_ts_);
                     }
                 }
             }
@@ -690,10 +694,21 @@ private:
             if (auto serialized = root.lookup(applied_ts_key())) {
                 applied_ts = str_to_ts(*serialized);
             }
-            spdlog::info("sending snapshot ts={0:d} for node={1:d}", applied_ts, node);
+
+            auto send_snapshot = [=] (RecoverySnapshot rec) {
+                rec.set_applied_ts(applied_ts);
+                spdlog::debug("snapshot ts = {0:1}, messages={1:d}", rec.applied_ts(), rec.operations_size());
+                bus::ErrorT<Response> resp = send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait();
+                bool result = resp && resp.unwrap().success();
+                if (!result) {
+                    spdlog::info("failed to recover {0:d}", node);
+                }
+                return result;
+            };
+
+            spdlog::info("sending snapshot ts={0:d} to node={1:d}", applied_ts, node);
             RecoverySnapshot rec;
-            rec.set_applied_ts(applied_ts);
-            root.iterate([&] (std::string_view key, std::string_view value) {
+            root.iterate([&] (std::string_view key, std::string_view value) mutable {
                     if (reserved_key(key) || ts_from_base_key(key) > applied_ts) {
                         return;
                     }
@@ -701,15 +716,14 @@ private:
                     op->set_key(std::string(key));
                     op->set_value(std::string(value));
                     if (rec.operations_size() >= options_.rpc_max_batch) {
-                        if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
+                        if (!send_snapshot(std::move(rec))) {
                             return;
                         }
                         rec.Clear();
-                        rec.set_applied_ts(applied_ts);
                     }
                 });
             rec.set_should_set_applied_ts(true);
-            if (!send<RecoverySnapshot, Response>(std::move(rec), node, kRecover, options_.heartbeat_timeout).wait()) {
+            if (!send_snapshot(std::move(rec))) {
                 return;
             }
             if (auto serialized = root.lookup(durable_ts_key())) {
@@ -750,6 +764,8 @@ private:
                     const size_t start_index = next_ts - start_ts;
                     for (size_t i = start_index; i < state->buffered_log_.size() && rpcs.records_size() < options_.rpc_max_batch; ++i) {
                         *rpcs.add_records() = state->buffered_log_[i];
+                        // avoiding rollbacks
+                        state->next_timestamps_[id] = state->buffered_log_[i].ts() + 1;
                     }
                 }
                 if (rpcs.records_size()) {
@@ -805,6 +821,8 @@ private:
         if (auto serialized = state->engine_.lookup(applied_ts_key())) {
             state->applied_ts_ = str_to_ts(*serialized);
         }
+        state->next_ts_ = state->durable_ts_ + 1;
+        assert(state->durable_ts_ >= state->applied_ts_);
         for (ssize_t i = state->applied_ts_ + 1; i < state->durable_ts_; ++i) {
             auto record = state->engine_.lookup(rollback_key(i));
             assert(record);
@@ -823,7 +841,7 @@ private:
             state->current_term_ = vote->term();
             state->leader_id_ = vote->vote_for();
         }
-        spdlog::info("recovered term={0:d} durable_ts={1:d} applied_ts={2:d}", state->current_term_, state->durable_ts_, state->applied_ts_);
+        spdlog::info("recovered term={0:d} durable_ts={1:d} applied_ts={2:d} next_ts={3:d}", state->current_term_, state->durable_ts_, state->applied_ts_, state->next_ts_);
     }
 
 private:
@@ -856,6 +874,7 @@ int main(int argc, char** argv) {
     options.bus_options.batch_opts.max_delay = parse_duration(conf["max_delay"]);
     size_t id = conf["id"].asInt();
     srand(id);
+    options.bus_options.tcp_opts.max_pending_messages = conf["max_pending_messages"].asInt();
     options.bus_options.greeter = id;
     options.bus_options.tcp_opts.port = conf["port"].asInt();
     options.bus_options.tcp_opts.fixed_pool_size = conf["pool_size"].asUInt64();
@@ -882,9 +901,9 @@ int main(int argc, char** argv) {
 
     spdlog::set_pattern("[%H:%M:%S.%e] [" + std::to_string(id) + "] [%^%l%$] %v");
 
-#ifndef NDEBUG
-    spdlog::set_level(spdlog::level::debug);
-#endif
+    if (auto level = conf["log_level"]; !level.isNull() && level.asString() == "debug") {
+        spdlog::set_level(spdlog::level::debug);
+    }
 
     spdlog::info("starting node");
 
