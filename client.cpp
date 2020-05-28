@@ -100,7 +100,7 @@ void print_statistics(std::vector<std::chrono::steady_clock::duration>& times, s
     for (auto time : times) {
         sum += time;
     }
-    std::cout << "avg " << std::chrono::duration_cast<std::chrono::nanoseconds>(sum).count() << "ns" << std::endl;
+    std::cout << "avg " << std::chrono::duration_cast<std::chrono::nanoseconds>(sum/times.size()).count() << "ns" << std::endl;
     std::cout << "min " << std::chrono::duration_cast<std::chrono::nanoseconds>(times[0]).count() << "ns" << std::endl;
     std::cout << "max " << std::chrono::duration_cast<std::chrono::nanoseconds>(times.back()).count() << "ns" << std::endl;
     ssize_t q50 = std::min<ssize_t>(times.size() * 0.5, ssize_t(times.size()) - 1);
