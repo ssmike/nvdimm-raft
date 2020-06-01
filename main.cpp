@@ -1,7 +1,7 @@
 #include "proto_bus.h"
 #include "messages.pb.h"
 #include "lock.h"
-#include "executor.h"
+#include "delayed_executor.h"
 #include "error.h"
 #include "client.pb.h"
 #include "engine.h"
@@ -558,8 +558,8 @@ private:
             if (latest_heartbeat + options_.election_timeout > now) {
                 return;
             }
-            spdlog::info("starting elections");
             term = ++state->current_term_;
+            spdlog::info("starting elections term={0:d}", term);
             state->voted_for_me_.clear();
             state->role_ = kCandidate;
             state->leader_id_ = std::nullopt;
@@ -611,7 +611,9 @@ private:
                                     state->commit_subscribers_.clear();
                                     state->advance_applied_timestamp();
                                     spdlog::info("becoming leader applied up to {0:d}", state->applied_ts_);
-                                    state->durable_timestamps_.assign(options_.members, state->applied_ts_);
+                                    for (auto & ts : state->durable_timestamps_) {
+                                        ts = std::min(ts, state->applied_ts_);
+                                    }
                                     state->next_timestamps_.assign(options_.members, state->applied_ts_ + 1);
                                 }
                             }
