@@ -1,1 +1,1 @@
-# nvdimm-optiomized raft implementation
+# nvdimm-optimized raft implementation
