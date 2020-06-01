@@ -588,7 +588,7 @@ private:
                 rpc.set_vote_for(id_);
                 for (size_t id = 0; id < options_.members; ++id) {
                     if (id != id_) {
-                        responses.push_back(send<VoteRpc, Response>(rpc, id, kVote, options_.heartbeat_timeout));
+                        responses.push_back(send<VoteRpc, Response>(rpc, id, kVote, std::nullopt));
                         ids.push_back(id);
                     }
                 }
@@ -778,7 +778,7 @@ private:
         }
         for (size_t i = 0; i < endpoints.size(); ++i) {
             bool to_log = messages[i].records_size() > 0;
-            send<AppendRpcs, Response>(std::move(messages[i]), endpoints[i], kAppendRpcs, options_.heartbeat_timeout)
+            send<AppendRpcs, Response>(std::move(messages[i]), endpoints[i], kAppendRpcs, std::nullopt)
                 .subscribe([=, id=endpoints[i]] (bus::ErrorT<Response>& result) {
                         std::vector<bus::Promise<bool>> subscribers;
                         if (result) {
