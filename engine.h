@@ -46,35 +46,39 @@ public:
             return alignof(uint64_t);
         }
 
-        bool operator < (const PersistentStr& oth) {
+        bool operator < (const PersistentStr& oth) const {
             return std::string_view{data(), size()} < std::string_view{oth.data(), oth.size()};
         }
 
-        bool operator <= (const PersistentStr& oth) {
+        bool operator > (const PersistentStr& oth) const {
+            return std::string_view{data(), size()} > std::string_view{oth.data(), oth.size()};
+        }
+
+        bool operator <= (const PersistentStr& oth) const {
             return std::string_view{data(), size()} <= std::string_view{oth.data(), oth.size()};
         }
 
-        bool operator == (const PersistentStr& oth) {
+        bool operator == (const PersistentStr& oth) const {
             return std::string_view{data(), size()} == std::string_view{oth.data(), oth.size()};
         }
 
-        bool operator < (const std::string_view& oth) {
+        bool operator < (const std::string_view& oth) const {
             return std::string_view{data(), size()} < oth;
         }
 
-        bool operator > (const std::string_view& oth) {
+        bool operator > (const std::string_view& oth) const {
             return std::string_view{data(), size()} > oth;
         }
 
-        bool operator <= (const std::string_view& oth) {
+        bool operator <= (const std::string_view& oth) const {
             return std::string_view{data(), size()} <= oth;
         }
 
-        bool operator >= (const std::string_view& oth) {
+        bool operator >= (const std::string_view& oth) const {
             return std::string_view{data(), size()} >= oth;
         }
 
-        bool operator == (const std::string_view& oth) {
+        bool operator == (const std::string_view& oth) const {
             return std::string_view{data(), size()} == oth;
         }
     };
@@ -206,7 +210,7 @@ private:
             assert_node(root);
             return { root };
         } else {
-            size_t pos = 0;
+            ssize_t pos = 0;
 
             PersistentStr insert_key;
             pmem::obj::persistent_ptr<char> insert_value;
@@ -216,9 +220,10 @@ private:
             //*new_root = *root;
 
             if (root->is_leaf) {
-                while (pos < root->key_count && root->keys[pos] < key) {
-                    ++pos;
-                }
+                //while (pos < root->key_count && root->keys[pos] < key) {
+                //    ++pos;
+                //}
+                pos = std::lower_bound(&root->keys[0], &root->keys[root->key_count], key) - &root->keys[0];
 
                 // insert() == replace()
                 if (pos < root->key_count && root->keys[pos] == key) {
@@ -231,9 +236,10 @@ private:
                 insert_key = key;
                 insert_value = value.ptr_;
             } else {
-                while (pos + 1 < root->key_count && root->keys[pos + 1] <= key) {
-                    ++pos;
-                }
+                //while (pos + 1 < root->key_count && root->keys[pos + 1] <= key) {
+                //    ++pos;
+                //}
+                pos = std::max<ssize_t>(std::upper_bound(&root->keys[0], &root->keys[root->key_count], key) - &root->keys[0] - 1, 0);
                 auto result = insert(root->child(pos).get(), key, value);
 
                 if (result.right) {
