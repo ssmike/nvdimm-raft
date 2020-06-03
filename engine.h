@@ -80,7 +80,7 @@ public:
     };
 
 private:
-    static constexpr size_t page_sz_ = 8192;
+    static constexpr size_t page_sz_ = 8192 * 16;
 
     static constexpr size_t max_children = 4;
     static constexpr size_t min_children = 2;
@@ -99,7 +99,7 @@ private:
     struct Page {
         pmem::obj::persistent_ptr<Page> next = nullptr;
         pmem::obj::p<uint64_t> used = 0;
-        std::array<char, page_sz_> data;
+        char data[page_sz_];
     };
 
     struct Root {
@@ -134,7 +134,7 @@ private:
                 page->used += align - (page->used & (align - 1));
             }
             if (page->used + sz <= page_sz_) {
-                auto ptr = page->data.data() + page->used;
+                auto ptr = page->data + page->used;
                 if (dirty_pages_.empty() || dirty_pages_.back().page != page.get()) {
                     dirty_pages_.push_back({ page.get(), page->used });
                 }
@@ -211,7 +211,9 @@ private:
             PersistentStr insert_key;
             pmem::obj::persistent_ptr<char> insert_value;
 
-            KeyNode new_root;
+            KeyNode* new_root = allocate<KeyNode>();
+            memcpy(new_root, root, sizeof(KeyNode));
+            //*new_root = *root;
 
             if (root->is_leaf) {
                 while (pos < root->key_count && root->keys[pos] < key) {
@@ -220,16 +222,14 @@ private:
 
                 // insert() == replace()
                 if (pos < root->key_count && root->keys[pos] == key) {
-                    auto result = allocate<KeyNode>();
-                    *result = *root;
-                    result->children[pos] = value.ptr_;
-                    return InsertResult{ .left = result, .right = nullptr };
+                    new_root->children[pos] = value.ptr_;
+                    assert_node(new_root);
+                    return InsertResult{ .left = new_root, .right = nullptr };
                 }
                 //
 
                 insert_key = key;
                 insert_value = value.ptr_;
-                new_root = *root;
             } else {
                 while (pos + 1 < root->key_count && root->keys[pos + 1] <= key) {
                     ++pos;
@@ -237,63 +237,69 @@ private:
                 auto result = insert(root->child(pos).get(), key, value);
 
                 if (result.right) {
-                    new_root = *root;
-                    new_root.keys[pos] = result.left->keys[0];
-                    new_root.children[pos] = (char*)result.left;
+                    new_root->keys[pos] = result.left->keys[0];
+                    new_root->children[pos] = (char*)result.left;
 
                     insert_key = result.right->keys[0];
                     insert_value = (char*)result.right;
                     ++pos;
                 } else {
-                    auto ret = allocate<KeyNode>();
-                    *ret = *root;
-                    ret->keys[pos] = result.left->keys[0];
-                    ret->children[pos] = (char*)result.left;
-                    assert_node(ret);
-                    return { ret };
+                    new_root->keys[pos] = result.left->keys[0];
+                    new_root->children[pos] = (char*)result.left;
+                    assert_node(new_root);
+                    return { new_root };
                 }
             }
 
-            if (new_root.key_count == max_children) {
+            if (new_root->key_count == max_children) {
                 InsertResult result;
-                result.left = allocate<KeyNode>();
+                result.left = new_root;
                 result.right = allocate<KeyNode>();
-                result.left->key_count = result.right->key_count = 0;
+                result.right->key_count = (max_children+1)/2;
+                //result.left->key_count = result.right->key_count = 0;
                 result.left->is_leaf = result.right->is_leaf = root->is_leaf;
 
-                auto add_key = [&, index=0] (PersistentStr key, pmem::obj::persistent_ptr<char> value) mutable {
-                    size_t mid = (max_children+1)/2;
-                    auto ptr = result.left;
-                    if (index >= mid) {
-                        ptr = result.right;
+                assert(new_root->key_count > result.right->key_count);
+                ssize_t rpos = ssize_t(result.right->key_count) - 1;
+                ssize_t lpos = new_root->key_count - result.right->key_count;
+                size_t lsize = lpos + 1;
+                assert(lpos + 1 + rpos + 1 == new_root->key_count + 1);
+
+                auto add_key = [&] (PersistentStr key, pmem::obj::persistent_ptr<char> value) mutable {
+                    if (rpos >= 0) {
+                        result.right->keys[rpos] = key;
+                        result.right->children[rpos] = value;
+                        --rpos;
+                    } else {
+                        result.left->keys[lpos] = key;
+                        result.left->children[lpos] = value;
+                        --lpos;
                     }
-                    ptr->keys[ptr->key_count] = key;
-                    ptr->children[ptr->key_count] = value;
-                    ++ptr->key_count;
-                    assert_node(ptr);
-                    ++index;
                 };
 
-                for (size_t i = 0; i < pos; ++i)
-                    add_key(new_root.keys[i], new_root.children[i]);
-                add_key(insert_key, insert_value);
-                for (size_t i = pos; i < max_children; ++i)
-                    add_key(new_root.keys[i], new_root.children[i]);
+                if (pos == new_root->key_count) {
+                    add_key(insert_key, insert_value);
+                }
+                for (ssize_t i = new_root->key_count - 1; i >= 0; --i) {
+                    add_key(new_root->keys[i], new_root->children[i]);
+                    if (i == pos) {
+                        add_key(insert_key, insert_value);
+                    }
+                }
+                result.left->key_count = lsize;
+
                 assert_node(result.left);
                 assert_node(result.right);
                 return result;
             } else {
-                ++new_root.key_count;
-                for (ssize_t i = new_root.key_count - 1; i > pos; --i) {
-                    new_root.keys[i] = new_root.keys[i - 1];
-                    new_root.children[i] = new_root.children[i - 1];
+                ++new_root->key_count;
+                for (ssize_t i = new_root->key_count - 1; i > pos; --i) {
+                    new_root->keys[i] = new_root->keys[i - 1];
+                    new_root->children[i] = new_root->children[i - 1];
                 }
-                new_root.keys[pos] = insert_key;
-                new_root.children[pos] = insert_value;
-                auto result = allocate<KeyNode>();
-                *result = new_root;
-                assert_node(result);
-                return { result };
+                new_root->keys[pos] = insert_key;
+                new_root->children[pos] = insert_value;
+                return { new_root };
             }
         }
     }
