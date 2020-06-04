@@ -50,3 +50,7 @@ target_link_libraries(client ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES} bus)
 add_executable(testEngine testEngine.cpp engine.h ${PROTO_HDRS} ${PROTO_SRCS})
 target_link_libraries(testEngine ${Protobuf_LIBRARIES} ${PMEMOBJ_LIBRARIES}
     ${LIBPMEMOBJ++_LIBRARIES})
+
+add_executable(benchEngine benchEngine.cpp engine.h ${PROTO_HDRS} ${PROTO_SRCS})
+target_link_libraries(benchEngine ${Protobuf_LIBRARIES} ${PMEMOBJ_LIBRARIES}
+    ${LIBPMEMOBJ++_LIBRARIES})
