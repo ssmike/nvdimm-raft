@@ -87,8 +87,8 @@ public:
 private:
     static constexpr size_t page_sz_ = 8192 * 16;
 
-    static constexpr size_t max_children = 4;
-    static constexpr size_t min_children = 2;
+    static constexpr size_t max_children = 10;
+    static constexpr size_t min_children = 4;
     struct KeyNode {
         std::array<pmem::obj::persistent_ptr<char>, max_children> children;
         std::array<PersistentStr, max_children> keys;
@@ -355,7 +355,7 @@ private:
             if (subnode->key_count < min_children) {
                 int di = pos == 0 && pos + 1 < subnode->key_count ? 1 : -1;
                 KeyNode* nodes[2];
-                if (pos == 0 || pos + 1 < subnode->key_count) {
+                if (pos == 0 || pos + 1 < node->key_count) {
                     nodes[0] = &*subnode;
                     nodes[1] = node->child(pos + 1).get();
                 } else {
