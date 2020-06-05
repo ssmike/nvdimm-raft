@@ -9,6 +9,7 @@
 #include <libpmemobj++/container/string.hpp>
 #include <libpmemobj++/container/vector.hpp>
 
+#include <filesystem>
 #include <mutex>
 #include <set>
 #include <string>
@@ -123,16 +124,22 @@ private:
     };
 
 private:
+    void allocpage() {
+        pmem::obj::transaction::run(
+            pool_,
+            [&] {
+                auto old = root_->free_pages;
+                root_->free_pages = pmem::obj::make_persistent<Page>();
+                root_->free_pages->next = old;
+            },
+            root_->lock);
+    }
+
     char* allocate(size_t sz, uint64_t align) {
         assert(sz + align <= page_sz_);
         while (true) {
             if (root_->free_pages == nullptr) {
-                pmem::obj::transaction::run(
-                    pool_,
-                    [&] {
-                        root_->free_pages = pmem::obj::make_persistent<Page>();
-                    },
-                    root_->lock);
+                allocpage();
             }
             auto page = root_->free_pages;
             if (page->used & (align - 1)) {
@@ -581,10 +588,19 @@ public:
     }
 
     void reset(std::string fname, size_t pool_size=PMEMOBJ_MIN_POOL, mode_t mode=S_IWUSR | S_IRUSR) {
-        if (pmem::obj::pool<Root>::check(fname, layout_) == 1) {
+        if (std::filesystem::exists(fname)) {
             pool_ = pmem::obj::pool<Root>::open(fname, layout_);
         } else {
             pool_ = pmem::obj::pool<Root>::create(fname, layout_, pool_size, mode);
+            root_ = pool_.root().get();
+            for (size_t i = 0; i + 1 < pool_size / sizeof(Page); ++i) {
+                try {
+                    allocpage();
+                } catch(pmem::transaction_out_of_memory) {
+                    // we shouldnt allocate any more
+                    break;
+                }
+            }
         }
         root_ = pool_.root().get();
         volatile_root_ = root_->durable_root_.get();
