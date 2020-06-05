@@ -24,6 +24,25 @@
 
 #define FATAL(cond) if (cond) { std::cerr << strerror(errno) << std::endl; std::terminate();}
 
+template<typename T>
+void should_be_set(bus::Future<T>& f) {
+    struct guard {
+        std::atomic_bool flag = true;
+
+        ~guard() {
+            if (flag.load()) {
+                std::cerr << "forgotten future" << std::endl;
+                std::terminate();
+            }
+        }
+    };
+
+    auto g = std::make_shared<guard>();
+    f.subscribe([=] (auto&) {
+            g->flag.store(false);
+        });
+}
+
 using duration = std::chrono::system_clock::duration;
 
 struct PersistentStrArray {
@@ -47,12 +66,12 @@ public:
         promise_.emplace(std::move(p));
     }
 
-    DelayedSetter(const DelayedSetter<T>&) = default;
+    DelayedSetter(const DelayedSetter<T>&) = delete;
     DelayedSetter(DelayedSetter<T>&& oth) {
         promise_.swap(oth.promise_);
     }
 
-    DelayedSetter<T>& operator = (const DelayedSetter<T>&) = default;
+    DelayedSetter<T>& operator = (const DelayedSetter<T>&) = delete;
     DelayedSetter<T>& operator = (DelayedSetter<T>&& oth) {
         promise_.swap(oth.promise_);
         return *this;
@@ -163,7 +182,6 @@ public:
     void store(VoteRpc vote) {
         auto str = engine_->allocate_str(vote.ByteSizeLong());
         vote.SerializeToArray(str.data(), str.size());
-        engine_->erase(key_name);
         engine_->insert(key_, str);
         engine_->commit();
     }
@@ -182,6 +200,21 @@ private:
     Engine* engine_ = nullptr;
     Engine::PersistentStr key_;
 };
+
+//template<typename F>
+//void timeit(F f, char* msg) {
+//    auto pt = std::chrono::steady_clock::now();
+//    f();
+//    spdlog::debug("tracepoint \"{0}\" taken {1:d}us", msg, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pt).count());
+//}
+//
+//template<typename F>
+//auto timeit_(F f, char* msg) {
+//    auto pt = std::chrono::steady_clock::now();
+//    auto result =  f();
+//    spdlog::debug("tracepoint \"{0}\" taken {1:d}us", msg, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pt).count());
+//    return result;
+//}
 
 class RaftNode : bus::ProtoBus {
 private:
@@ -230,6 +263,13 @@ private:
         std::chrono::system_clock::time_point latest_heartbeat_;
         std::optional<uint64_t> leader_id_;
 
+        bool match_message(const LogRecord& rec) {
+            if (buffered_log_.empty() || rec.ts() < buffered_log_[0].ts() || rec.ts() > buffered_log_.back().ts()) {
+                return true;
+            }
+            return buffered_log_[rec.ts() - buffered_log_[0].ts()].SerializeAsString() != rec.SerializeAsString();
+        }
+
         Response create_response(bool success) {
             Response response;
             response.set_term(current_term_);
@@ -242,27 +282,32 @@ private:
         size_t write_num = 0;
         size_t flush_frequency = 0;
         DelayedSetter<bool> flush() {
-            durable_ts_ = next_ts_ - 1;
-            if (durable_ts_ >= 0) {
-                engine_.insert(engine_.copy_str(durable_ts_key()), engine_.copy_str(ts_to_str(durable_ts_)));
-            }
-            engine_.commit();
-            if (role_ == kLeader) {
-                advance_applied_timestamp();
-            }
             bus::Promise<bool> new_;
-            new_.future().subscribe([subs=pick_subscribers()] (auto&) mutable {
-                    for (auto& sub : subs) {
-                        sub.set_value_once(true);
-                    }
-                });
+            if (durable_ts_ + 1 < next_ts_) {
+                std::chrono::steady_clock::time_point pt = std::chrono::steady_clock::now();
+                durable_ts_ = next_ts_ - 1;
+                if (durable_ts_ >= 0) {
+                    engine_.insert(engine_.copy_str(durable_ts_key()), engine_.copy_str(ts_to_str(durable_ts_)));
+                }
+                engine_.commit();
+                if (role_ == kLeader) {
+                    advance_applied_timestamp();
+                }
+
+                new_.future().subscribe([subs=pick_subscribers()] (auto&) mutable {
+                        for (auto& sub : subs) {
+                            sub.set_value_once(true);
+                        }
+                    });
+                spdlog::debug("flush taken {0:d}us", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pt).count());
+            }
             new_.swap(flush_event_);
             write_num = 0;
             return new_;
         }
 
         DelayedSetter<bool> account_write() {
-            if (write_num >= flush_frequency == 0) {
+            if (write_num % flush_frequency == 0) {
                 return flush();
             } else {
                 return {};
@@ -272,9 +317,9 @@ private:
         void rollback(const LogRecord& rec) {
             spdlog::debug("rolling back record with ts={0:d}", rec.ts());
             for (auto& op : rec.operations()) {
-                engine_.erase(base_key(op.key(), rec.ts()));
+                engine_.unsafe_erase(base_key(op.key(), rec.ts()));
             }
-            engine_.erase(rollback_key(rec.ts()));
+            //engine_.unsafe_erase(rollback_key(rec.ts()));
         }
 
         void write(const LogRecord& rec) {
@@ -292,6 +337,7 @@ private:
                 memcpy(rollback_record.data() + offset, &_key, sizeof(Engine::PersistentStr));
             }
             engine_.insert(engine_.copy_str(rollback_key(rec.ts())), rollback_record);
+            spdlog::debug("write ts={0:d}", rec.ts());
         }
 
         void advance_to(int64_t ts) {
@@ -306,12 +352,12 @@ private:
                             engine_.iterate(op.key(), base_key(op.key(), buffered_log_[pos].ts()),
                                 [&] (std::string_view key, auto) {
                                     if (prevkey) {
-                                        engine_.erase(*prevkey);
+                                        engine_.unsafe_erase(*prevkey);
                                     }
                                     prevkey = key;
                                 });
                         }
-                        engine_.erase(rollback_key(buffered_log_[pos].ts()));
+                        engine_.unsafe_erase(rollback_key(buffered_log_[pos].ts()));
                     }
                 }
                 if (old_ts < applied_ts_) {
@@ -350,7 +396,7 @@ private:
             }
             std::sort(tss.begin(), tss.end());
             auto ts = tss[tss.size() / 2];
-            advance_to(ts);
+            advance_to(std::min(durable_ts_, ts));
         }
 
     };
@@ -379,9 +425,9 @@ public:
         , buffer_pool_(options.bus_options.tcp_opts.max_message_size)
         , options_(options)
         , elector_([this] { initiate_elections(); }, options.election_timeout)
-        , flusher_([this] { timed_flush(); }, options.flush_interval)
+        , flusher_([this] { timed_flush(); }, options.flush_interval, ProtoBus::executor())
         , gc_([engine=&state_.get()->engine_] { engine->gc(); }, options.gc_frequency)
-        , sender_([this] { heartbeat_to_followers(); }, options.heartbeat_interval)
+        , sender_([this] { heartbeat_to_followers(); }, options.heartbeat_interval, ProtoBus::executor())
         , stale_nodes_agent_( [this] { recover_stale_nodes(); }, options.heartbeat_interval)
     {
         {
@@ -403,8 +449,11 @@ public:
         flusher_.start();
         using namespace std::placeholders;
         register_handler<VoteRpc, Response>(kVote, [&] (int, VoteRpc rpc) { return bus::make_future(vote(rpc)); });
-        register_handler<AppendRpcs, Response>(kAppendRpcs, std::bind(&RaftNode::handle_append_rpcs, this, _1, _2));
-        register_handler<ClientRequest, ClientResponse>(kClientReq, std::bind(&RaftNode::handle_client_request, this, _1, _2));
+        register_handler<AppendRpcs, Response>(kAppendRpcs,
+            [=](int node, AppendRpcs rpc, bus::Promise<Response> promise) {
+                handle_append_rpcs(node, std::move(rpc), std::move(promise));
+            });
+        register_handler<ClientRequest, ClientResponse>(kClientReq, [=](int node, ClientRequest req) { return handle_client_request(node, std::move(req)); } );
         register_handler<RecoverySnapshot, Response>(kRecover, [&](int, RecoverySnapshot s) {
             Response r;
             r.set_success(handle_recovery_snapshot(std::move(s)));
@@ -444,7 +493,7 @@ private:
             state->engine_.insert(state->engine_.copy_str(applied_ts_key()), state->engine_.copy_str(ts_to_str(s.applied_ts())));
             state->engine_.iterate(rollback_key(0), rollback_key(state->applied_ts_),
                 [&] (auto key, auto value) {
-                    state->engine_.erase(key);
+                    state->engine_.unsafe_erase(key);
                 });
             state->engine_.commit();
             spdlog::debug("set applied_ts={0:d}", s.applied_ts());
@@ -477,7 +526,9 @@ private:
 
     bus::Future<ClientResponse> handle_client_request(int id, ClientRequest req) {
         DelayedSetter<bool> flush_event;
-        bus::Future<bool> commit_future;
+        bus::Future<ClientResponse> commit_future;
+        LogRecord rec;
+        auto handle_req_start = std::chrono::steady_clock::now();
         {
             auto state = state_.get();
             if (state->role_ == kFollower) {
@@ -495,7 +546,6 @@ private:
                 return bus::make_future(std::move(response));
             }
             if (state->role_ == kLeader) {
-                LogRecord rec;
                 ClientResponse response;
                 bool has_writes = false;
                 bool has_reads = false;
@@ -527,16 +577,23 @@ private:
                 }
                 rec.set_ts(state->next_ts_++);
                 spdlog::debug("handling client request ts={0:d}", rec.ts());
-                state->write(rec);
                 auto promise = bus::Promise<bool>();
                 state->commit_subscribers_.insert({ rec.ts(), promise });
+                state->write(rec);
                 state->buffered_log_.push_back(std::move(rec));
-                sender_.trigger();
-                flush_event = state->account_write();
-                return promise.future().map([response=std::move(response)](bool) { return response; });
+                //flush_event = state->account_write();
+                commit_future = promise.future().map([response=std::move(response)](bool) { return response; });
             }
         }
-        FATAL(true);
+        heartbeat_to_followers();
+        {
+            auto state = state_.get();
+            flush_event = state->account_write();
+        }
+        commit_future.subscribe([=] (auto&) {
+                spdlog::debug("commit taken {0:d}us", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - handle_req_start).count());
+            });
+        return commit_future;
     }
 
     void initiate_elections() {
@@ -588,7 +645,7 @@ private:
                 rpc.set_vote_for(id_);
                 for (size_t id = 0; id < options_.members; ++id) {
                     if (id != id_) {
-                        responses.push_back(send<VoteRpc, Response>(rpc, id, kVote, std::nullopt));
+                        responses.push_back(send<VoteRpc, Response>(rpc, id, kVote, options_.heartbeat_interval));
                         ids.push_back(id);
                     }
                 }
@@ -622,14 +679,15 @@ private:
         }
     }
 
-    bus::Future<Response> handle_append_rpcs(int id, AppendRpcs msg) {
+    void handle_append_rpcs(int id, AppendRpcs msg, bus::Promise<Response> response) {
         DelayedSetter<bool> flush_notifier;
-        bus::Future<bool> flush_event;
+        //bus::Future<bool> flush_event;
         bool has_new_records = false;
         {
             auto state = state_.get();
             if (msg.term() < state->current_term_) {
-                return bus::make_future(state->create_response(false));
+                response.set_value(state->create_response(false));
+                return;
             }
             if (msg.term() > state->current_term_) {
                 spdlog::info("stale term becoming follower");
@@ -640,9 +698,14 @@ private:
             state->role_ = kFollower;
             state->latest_heartbeat_ = std::chrono::system_clock::now();
             state->leader_id_ = id;
-
+            if (msg.records_size()) {
+                spdlog::debug("handling heartbeat next_ts={0:d}", state->next_ts_);
+            }
             for (auto& rpc : msg.records()) {
                 if (rpc.ts() <= state->applied_ts_) {
+                    continue;
+                }
+                if (rpc.ts() < state->next_ts_ && state->match_message(rpc)) {
                     continue;
                 }
                 while (rpc.ts() < state->next_ts_) {
@@ -659,17 +722,32 @@ private:
                     has_new_records = true;
                 }
             }
+            state->flush_event_.future().subscribe([this, response] (bool) mutable { response.set_value(state_.get()->create_response(true)); } );
+            //flush_event = state->flush_event_.future();
+
             if (msg.records_size()) {
-                spdlog::debug("handling heartbeat next_ts={0:d}", state->next_ts_);
+                flush_notifier = state->account_write();
             }
+
             state->advance_to(std::min(msg.applied_ts(), state->durable_ts_));
-            flush_event = state->flush_event_.future();
-            flush_notifier = state->account_write();
+            if (msg.records_size()) {
+                spdlog::debug("heartbeat handled next_ts={0:d}", state->next_ts_);
+            }
         }
-        if (has_new_records) {
-            flusher_.trigger();
+
+        flush_notifier.set();
+
+        {
+            auto state = state_.get();
+            if (state->role_ != kLeader) {
+                state->advance_to(std::min(msg.applied_ts(), state->durable_ts_));
+            }
         }
-        return flush_event.map([this](bool) { return state_.get()->create_response(true); });
+        //should_be_set(flush_event);
+        //flush_event.subscribe([pt=std::chrono::steady_clock::now()] (auto&) {
+        //        spdlog::debug("respond to heartbeat after {0:d}us", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pt).count());
+        //    });
+        //return flush_event.map([this](bool) { return state_.get()->create_response(true); });
     }
 
     void recover_stale_nodes() {
@@ -771,14 +849,14 @@ private:
                     }
                 }
                 if (rpcs.records_size()) {
-                    spdlog::debug("sending to {0:d} {1:d} records", id, rpcs.records_size());
+                    spdlog::debug("sending to {0:d} {1:d} records upper ts={2:d}", id, rpcs.records_size(), state->buffered_log_.back().ts());
                 }
                 messages.push_back(std::move(rpcs));
             }
         }
         for (size_t i = 0; i < endpoints.size(); ++i) {
             bool to_log = messages[i].records_size() > 0;
-            send<AppendRpcs, Response>(std::move(messages[i]), endpoints[i], kAppendRpcs, std::nullopt)
+            send<AppendRpcs, Response>(std::move(messages[i]), endpoints[i], kAppendRpcs, options_.heartbeat_interval)
                 .subscribe([=, id=endpoints[i]] (bus::ErrorT<Response>& result) {
                         std::vector<bus::Promise<bool>> subscribers;
                         if (result) {
@@ -793,13 +871,14 @@ private:
                                 }
                                 state->advance_applied_timestamp();
                                 subscribers = state->pick_subscribers();
+                                for (auto& f : subscribers) {
+                                    f.set_value(true);
+                                }
                             } else {
                                 spdlog::debug("node {0:d} failed heartbeat", id);
                             }
                         }
-                        for (auto& f : subscribers) {
-                            f.set_value(true);
-                        }
+
                     } );
         }
     }
@@ -810,7 +889,6 @@ private:
             auto state = state_.get();
             to_deliver = state->flush();
         }
-
         to_deliver.set();
     }
 
@@ -849,7 +927,7 @@ private:
 private:
     bus::BufferPool buffer_pool_;
     Options options_;
-    bus::internal::ExclusiveWrapper<State> state_;
+    bus::internal::ExclusiveWrapper<State, bus::internal::SpinLock> state_;
 
     bus::internal::PeriodicExecutor elector_;
     bus::internal::PeriodicExecutor flusher_;
@@ -876,7 +954,9 @@ int main(int argc, char** argv) {
     options.bus_options.batch_opts.max_delay = parse_duration(conf["max_delay"]);
     size_t id = conf["id"].asInt();
     srand(id);
-    options.bus_options.tcp_opts.max_pending_messages = conf["max_pending_messages"].asInt();
+    if (auto max_messages = conf["max_pending_messages"]; !max_messages.isNull()) {
+        options.bus_options.tcp_opts.max_pending_messages = max_messages.asInt();
+    }
     options.bus_options.greeter = id;
     options.bus_options.tcp_opts.port = conf["port"].asInt();
     options.bus_options.tcp_opts.fixed_pool_size = conf["pool_size"].asUInt64();
@@ -901,7 +981,7 @@ int main(int argc, char** argv) {
     options.pool_size = conf["db_pool_size"].asUInt64() * 1024 * 1024;
     options.members = members.size();
 
-    spdlog::set_pattern("[%H:%M:%S.%e] [" + std::to_string(id) + "] [%^%l%$] %v");
+    spdlog::set_pattern("[%H:%M:%S.%F] [" + std::to_string(id) + "] [%^%l%$] %v");
 
     if (auto level = conf["log_level"]; !level.isNull() && level.asString() == "debug") {
         spdlog::set_level(spdlog::level::debug);
