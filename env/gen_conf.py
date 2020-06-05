@@ -33,7 +33,7 @@ confs = {
         'rotate_interval': 200,
         'applied_backlog': 0,
         'flush_interval': 0.05,
-        'flush_req_inteval': 10,
+        'flush_req_interval': 10,
         'timeout': 2,
         'rpc_max_batch': 10,
         'log': os.path.join('storage', '%d.dir' % (i,))
