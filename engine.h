@@ -490,6 +490,7 @@ private:
         if (!node) {
             return;
         }
+        collector.push_back(node.raw());
         for (size_t i = 0; i < node->key_count; ++i) {
             visit_str(node->keys[i], collector);
             if (node->is_leaf) {
