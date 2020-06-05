@@ -87,7 +87,7 @@ public:
 private:
     static constexpr size_t page_sz_ = 8192 * 16;
 
-    static constexpr size_t max_children = 10;
+    static constexpr size_t max_children = 7;
     static constexpr size_t min_children = 4;
     struct KeyNode {
         std::array<pmem::obj::persistent_ptr<char>, max_children> children;
@@ -345,71 +345,95 @@ private:
             //}
             pos = std::max<ssize_t>(std::upper_bound(&root->keys[0], &root->keys[root->key_count], key) - &root->keys[0] - 1, 0);
             auto subnode = erase((KeyNode*)root->children[pos].get(), key);
-            //if (root->key_count == 1) {
-            //    return subnode;
-            //}
+            if (root->key_count == 1) {
+                return subnode;
+            }
             assert(subnode);
             KeyNode* node = allocate<KeyNode>();
             memcpy(node, root, sizeof(KeyNode));
+            node->children[pos] = (char*)subnode;
 
             if (subnode->key_count < min_children) {
                 int di = pos == 0 && pos + 1 < subnode->key_count ? 1 : -1;
-                KeyNode* nodes[2];
-                if (pos == 0 || pos + 1 < node->key_count) {
-                    nodes[0] = &*subnode;
-                    nodes[1] = node->child(pos + 1).get();
+
+                const size_t secondary_count = node->child(pos + di)->key_count + subnode->key_count;
+                if (secondary_count > max_children) {
+                    const size_t cut = secondary_count / 2;
+                    KeyNode* neighbor = allocate<KeyNode>();
+                    memcpy(neighbor, node->child(pos + di).get(), sizeof(KeyNode));
+                    node->children[pos + di] = (char*)neighbor;
+
+                    KeyNode* left = node->child(pos + std::min(0, di)).get();
+                    KeyNode* right = node->child(pos + std::max(0, di)).get();
+
+                    assert(cut >= min_children);
+                    assert(secondary_count - cut >= min_children);
+                    assert(secondary_count - cut < max_children);
+
+                    if (left->key_count > cut) {
+                        size_t delta = left->key_count - cut;
+                        for (ssize_t i = right->key_count - 1; i >= 0; --i) {
+                            right->children[i + delta] = right->children[i];
+                            right->keys[i + delta] = right->keys[i];
+                        }
+                        for (size_t i = 0; i < delta; ++i) {
+                            right->children[i] = left->children[cut + i];
+                            right->keys[i] = left->keys[cut + i];
+                        }
+                    } else {
+                        size_t delta = cut - left->key_count;
+                        for (size_t i = 0; i < delta; ++i) {
+                            left->keys[left->key_count + i] = right->keys[i];
+                            left->children[left->key_count + i] = right->children[i];
+                        }
+                        size_t rsize = secondary_count - cut;
+                        for (size_t i = 0; i < rsize; ++i) {
+                            right->children[i] = right->children[i + delta];
+                            right->keys[i] = right->keys[i + delta];
+                        }
+                    }
+
+                    left->key_count = cut;
+                    right->key_count = secondary_count - cut;
+
+                    node->keys[pos] = node->child(pos)->keys[0];
+                    node->keys[pos + di] = node->child(pos + di)->keys[0];
+                    assert_node(node);
                 } else {
-                    nodes[0] = node->child(pos - 1).get();
-                    nodes[1] = &*subnode;
-                    --pos;
-                }
-                assert_node(nodes[0]);
-                assert_node(nodes[1]);
+                    KeyNode* neighbor = node->child(pos + di).get();
+                    node->children[pos + di] = nullptr;
 
-                size_t secondary_count = nodes[0]->key_count + nodes[1]->key_count;
-                size_t cut = secondary_count;
-
-                node->children[pos] = (char*)allocate<KeyNode>();
-                node->child(pos)->key_count = 0;
-                node->child(pos)->is_leaf = subnode->is_leaf;
-
-                if (secondary_count >= 2 * min_children) {
-                    node->children[pos + 1] = (char*)allocate<KeyNode>();
-                    node->child(pos + 1)->key_count = 0;
-                    node->child(pos + 1)->is_leaf = subnode->is_leaf;
-                    cut = min_children;
-                } else {
-                    node->children[pos + 1] = nullptr;
-                    cut = secondary_count;
-                }
-
-                auto add_kv = [&](PersistentStr key, pmem::obj::persistent_ptr<char> value) {
-                    auto ptr = node->child(pos).get();
-                    if (ptr->key_count >= cut) {
-                        ptr = node->child(pos + 1).get();
+                    if (di < 0) {
+                        ssize_t delta = neighbor->key_count;
+                        for (ssize_t i = subnode->key_count - 1; i >= 0; --i) {
+                            subnode->keys[i + delta] = subnode->keys[i];
+                            subnode->children[i + delta] = subnode->children[i];
+                        }
+                        for (size_t i = 0; i < delta; ++i) {
+                            subnode->keys[i] = neighbor->keys[i];
+                            subnode->children[i] = neighbor->children[i];
+                        }
+                        subnode->key_count += delta;
+                        assert_node(subnode);
+                    } else {
+                        for (size_t i = 0; i < neighbor->key_count; ++i) {
+                            subnode->keys[subnode->key_count] = neighbor->keys[i];
+                            subnode->children[subnode->key_count] = neighbor->children[i];
+                            ++subnode->key_count;
+                        }
+                        assert_node(subnode);
                     }
-                    ptr->keys[ptr->key_count] = key;
-                    ptr->children[ptr->key_count] = value;
-                    ++ptr->key_count;
-                    assert(ptr->key_count <= max_children);
-                    assert_node(ptr);
-                };
-
-                for (size_t i = 0; i < 2; ++i) {
-                    auto ptr = nodes[i];
-                    for (size_t j = 0; j < ptr->key_count; ++j) {
-                        add_kv(ptr->keys[j], ptr->child(j).raw());
-                    }
-                    if (node->child(pos + i)) {
-                        node->keys[pos + i] = node->child(pos + i)->keys[0];
-                    }
+                    node->keys[pos] = node->child(pos)->keys[0];
                 }
 
-                if (!node->child(pos + 1)) {
-                    for (ssize_t i = pos + 1; i < node->key_count; ++i) {
-                        node->children[i] = node->children[i + 1];
+                for (ssize_t i = pos + di; i + 1 < node->key_count; ++i) {
+                    if (node->children[i] == nullptr) {
                         node->keys[i] = node->keys[i + 1];
+                        node->children[i] = node->children[i + 1];
+                        node->children[i + 1] = nullptr;
                     }
+                }
+                if (node->children[node->key_count - 1] == nullptr) {
                     --node->key_count;
                 }
 
