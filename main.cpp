@@ -4,7 +4,7 @@
 #include "delayed_executor.h"
 #include "error.h"
 #include "client.pb.h"
-#include "engine.h"
+#include "engine2.h"
 
 #include <google/protobuf/arena.h>
 
@@ -903,11 +903,12 @@ private:
         }
         state->next_ts_ = state->durable_ts_ + 1;
         assert(state->durable_ts_ >= state->applied_ts_);
-        for (ssize_t i = state->applied_ts_ + 1; i < state->durable_ts_; ++i) {
+        for (ssize_t i = state->applied_ts_ + 1; i <= state->durable_ts_; ++i) {
             auto record = state->engine_.lookup(rollback_key(i));
             assert(record);
             PersistentStrArray array{const_cast<char*>(record->data()), record->size()};
             state->buffered_log_.emplace_back();
+            state->buffered_log_.back().set_ts(i);
             for (size_t j = 0; j < array.size(); ++j) {
                 auto op = state->buffered_log_.back().add_operations();
                 auto key = ::from_base_key({ array[j].data(), array[j].size() });
