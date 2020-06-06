@@ -125,7 +125,7 @@ void parallel_workload(Client& client, size_t members) {
     constexpr size_t mod = 10;
     bus::internal::Event event;
     bus::internal::ExclusiveWrapper<std::vector<std::chrono::steady_clock::duration>> times;
-    std::atomic_uint64_t inflight;
+    std::atomic_uint64_t inflight = 0;
     for (size_t i = 0; i < repeats; ++i) {
         event.reset();
         std::string key = std::to_string(i % mod);
@@ -133,7 +133,7 @@ void parallel_workload(Client& client, size_t members) {
         auto pt = std::chrono::steady_clock::now();
 
         event.reset();
-        while (inflight >= maxinflight) {
+        while (inflight.load() >= maxinflight) {
             event.wait();
             event.reset();
         }
@@ -144,7 +144,7 @@ void parallel_workload(Client& client, size_t members) {
                 inflight.fetch_sub(1);
                 auto time = std::chrono::steady_clock::now() - pt;
                 verify(resp);
-                event.set();
+                event.notify();
                 times.get()->push_back(time);
             });
     }
