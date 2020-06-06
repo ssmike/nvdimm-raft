@@ -35,11 +35,11 @@ add_subdirectory(bus)
 include_directories(
     bus
     ${JSONCPP_INCLUDE_DIRS}
-    ${PMEMOBJ_INCLUDE_DIRECTORIES} 
-    ${PMEMBLK_INCLUDE_DIRECTORIES}
-    ${PMEMLOG_INCLUDE_DIRECTORIES}
-    ${PMEMPOOL_INCLUDE_DIRECTORIES}
-    ${LIBPMEMOBJ++_INCLUDE_DIRECTORIES})
+    ${PMEMOBJ_INCLUDE_DIRS} 
+    ${PMEMBLK_INCLUDE_DIRS}
+    ${PMEMLOG_INCLUDE_DIRS}
+    ${PMEMPOOL_INCLUDE_DIRS}
+    ${LIBPMEMOBJ++_INCLUDE_DIRS})
 
 target_link_libraries(main ${JSONCPP_LIBRARIES} ${Protobuf_LIBRARIES}
     ${spdlog_LIBRARIES} ${LIBPMEMOBJ++_LIBRARIES} fmt::fmt bus)
@@ -51,6 +51,8 @@ add_executable(testEngine testEngine.cpp engine.h ${PROTO_HDRS} ${PROTO_SRCS})
 target_link_libraries(testEngine ${Protobuf_LIBRARIES} ${PMEMOBJ_LIBRARIES}
     ${LIBPMEMOBJ++_LIBRARIES})
 
+pkg_check_modules(PMEMKV REQUIRED libpmemkv)
 add_executable(benchEngine benchEngine.cpp engine.h ${PROTO_HDRS} ${PROTO_SRCS})
+target_include_directories(benchEngine PRIVATE ${PMEMKV_INCLUDE_DIRS})
 target_link_libraries(benchEngine ${Protobuf_LIBRARIES} ${PMEMOBJ_LIBRARIES}
-    ${LIBPMEMOBJ++_LIBRARIES})
+    ${LIBPMEMOBJ++_LIBRARIES} ${PMEMKV_LIBRARIES})
