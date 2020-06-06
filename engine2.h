@@ -256,6 +256,7 @@ public:
                 }
                 visited_keys.insert(node->key.view());
             }
+            volatile_root_.store(root_->durable_root_.get());
         } else {
             pool_ = pmem::obj::pool<Root>::create(fname, layout_, pool_size, mode);
             root_ = pool_.root().get();
@@ -287,8 +288,8 @@ public:
         auto kvnode = allocate<KVNode>();
         kvnode->key = key;
         kvnode->value = value;
-        kvnode->next = volatile_root_;
-        volatile_root_ = kvnode;
+        kvnode->next = volatile_root_.load();
+        volatile_root_.store(kvnode);
 
         index_[key.view()] = kvnode;
     }
@@ -313,8 +314,8 @@ public:
         auto kvnode = allocate<KVNode>();
         kvnode->key = copy_str(key);
         kvnode->tombstone = true;
-        kvnode->next = volatile_root_;
-        volatile_root_ = kvnode;
+        kvnode->next = volatile_root_.load();
+        volatile_root_.store(kvnode);
 
         index_.erase(key);
     }
@@ -343,7 +344,7 @@ public:
             pool_,
             [&] {
                 root_->stale_gc_root_ = root_->used_pages;
-                root_->durable_root_ = volatile_root_;
+                root_->durable_root_ = volatile_root_.load();
             });
     }
 
@@ -424,7 +425,7 @@ private:
     const std::string layout_ = "kv_engine";
     std::vector<DirtyPage> dirty_pages_;
 
-    KVNode* volatile_root_ = nullptr;
+    std::atomic<KVNode*> volatile_root_ = nullptr;
 
     std::mutex root_lock;
 };
