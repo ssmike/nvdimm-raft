@@ -97,9 +97,6 @@ public:
 private:
     static constexpr size_t page_sz_ = 8192 * 16;
 
-    static constexpr size_t max_children = 7;
-    static constexpr size_t min_children = 4;
-
     struct KVNode {
         PersistentStr key;
         PersistentStr value;
@@ -117,8 +114,6 @@ private:
         pmem::obj::persistent_ptr<Page> free_pages = nullptr;
         pmem::obj::persistent_ptr<Page> used_pages = nullptr;
 
-        pmem::obj::mutex lock;
-
         pmem::obj::persistent_ptr<KVNode> durable_root_;
         pmem::obj::persistent_ptr<Page> stale_gc_root_;
     };
@@ -130,14 +125,14 @@ private:
 
 private:
     void allocpage() {
+        std::unique_lock lock(root_lock);
         pmem::obj::transaction::run(
             pool_,
             [&] {
                 auto old = root_->free_pages;
                 root_->free_pages = pmem::obj::make_persistent<Page>();
                 root_->free_pages->next = old;
-            },
-            root_->lock);
+            });
     }
 
     char* allocate(size_t sz, uint64_t align) {
@@ -158,14 +153,14 @@ private:
                 page->used += sz;
                 return ptr;
             } else {
+                std::unique_lock lock(root_lock);
                 pmem::obj::transaction::run(
                     pool_,
                     [&] {
                         root_->free_pages = page->next;
                         page->next = root_->used_pages;
                         root_->used_pages = page;
-                    },
-                    root_->lock);
+                    });
             }
         }
     }
@@ -234,7 +229,7 @@ public:
 
     RootHolder root() {
         std::unique_lock gc_lock{gc_lock_};
-        std::unique_lock lock{root_->lock};
+        std::unique_lock lock{root_lock};
         return RootHolder{
             root_->durable_root_.get(),
             std::move(gc_lock),
@@ -343,13 +338,13 @@ public:
     }
 
     void store_root() {
+        std::unique_lock lock{root_lock};
         pmem::obj::transaction::run(
             pool_,
             [&] {
                 root_->stale_gc_root_ = root_->used_pages;
                 root_->durable_root_ = volatile_root_;
-            },
-            root_->lock);
+            });
     }
 
     void commit() {
@@ -366,7 +361,7 @@ public:
         pmem::obj::persistent_ptr<Page> stale_gc_root;
         KVNode* durable_root;
         {
-            std::unique_lock lock(root_->lock);
+            std::unique_lock lock{root_lock};
             stale_gc_root = root_->stale_gc_root_;
             durable_root = root_->durable_root_.get();
         }
@@ -430,6 +425,8 @@ private:
     std::vector<DirtyPage> dirty_pages_;
 
     KVNode* volatile_root_ = nullptr;
+
+    std::mutex root_lock;
 };
 
 inline bool operator < (std::string_view view, Engine::PersistentStr str) {
