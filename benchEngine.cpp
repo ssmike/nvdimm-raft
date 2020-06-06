@@ -1,4 +1,4 @@
-#include "engine.h"
+#include "engine2.h"
 #include <libpmemkv.hpp>
 
 #include <chrono>
@@ -24,6 +24,7 @@ int main(int argc, char** argv) {
         keys.push_back(std::to_string(rand()));
         values.push_back(std::to_string(i));
         engine.insert(engine.copy_str(keys.back()), engine.copy_str(values.back()));
+        engine.flush();
     }
     std::cout << "engine inserts " << mcs() << std::endl;
 
@@ -31,6 +32,7 @@ int main(int argc, char** argv) {
     while (!keys.empty()) {
         engine.unsafe_erase(keys.back());
         keys.pop_back();
+        engine.flush();
     }
     std::cout << "engine erases " << mcs() << std::endl;
 
@@ -39,20 +41,21 @@ int main(int argc, char** argv) {
         cfg.put_int64("size", size);
         cfg.put_string("path", std::string(argv[1]) + name);
 
-        pmem::kv::db engine;
-        engine.open(name, std::move(cfg));
+        pmem::kv::db db;
+        db.open(name, std::move(cfg));
 
+        auto pt = std::chrono::steady_clock::now();
         for (size_t i = 0; i < inserts; ++i) {
             keys.push_back(std::to_string(rand()));
             values.push_back(std::to_string(i));
-            engine.put(keys.back(), values.back());
+            db.put(keys.back(), values.back());
         }
         std::cout << name << " inserts " << mcs() << std::endl;
 
         pt = std::chrono::steady_clock::now();
         while (!keys.empty()) {
-            engine.remove(keys.back());
-            keys.pop_back();
+          db.remove(keys.back());
+          keys.pop_back();
         }
         std::cout << name << " erases " << mcs() << std::endl;
     }
