@@ -728,6 +728,7 @@ public:
                         page->next = page->next->next;
                         free->next = root_->free_pages;
                         root_->free_pages = free;
+                        page->next->used = 0;
                     }
                 }
             });

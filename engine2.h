@@ -406,6 +406,7 @@ public:
             [&] {
                 for (auto page = stale_gc_root; page && page->next; page = page->next) {
                     if (page_set.find(page->next) == page_set.end()) {
+                        page->next->used = 0;
                         auto free = page->next;
                         page->next = page->next->next;
                         free->next = root_->free_pages;
