@@ -418,9 +418,6 @@ public:
                         for (auto node = volatile_root_.load(); node; node = node->next.get()) {
                             visit_node(node, visited);
                         }
-                        for (auto [_, ptr] : index_) {
-                            visit_node(ptr, visited);
-                        }
                         for (auto ptr : visited) {
                             assert(ptr.raw().off < free.raw().off || ptr.raw().off > free.raw().off + sizeof(Page));
                         }
