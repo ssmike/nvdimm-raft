@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
    }
    std::cout << "engine erases " << mcs() << std::endl;
 
-    for (auto name : {"cmap", "stree", "csmap", "tree3"}) {
+    for (auto name : {"cmap", "stree", "tree3"}) {
         pmem::kv::config cfg;
         cfg.put_int64("size", size);
         auto path = std::string(argv[1]) + name;
