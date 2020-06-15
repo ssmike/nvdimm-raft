@@ -33,6 +33,9 @@ public:
         }
 
         std::string_view view() const {
+            std::string_view result{ data(), size() };
+            assert(data() == result.data());
+            assert(size() == result.size());
             return { data(), size() };
         }
 
@@ -96,12 +99,13 @@ public:
 
 private:
     static constexpr size_t page_sz_ = 8192 * 16;
+    //static constexpr size_t page_sz_ = 120;
 
     struct KVNode {
         PersistentStr key;
         PersistentStr value;
-        bool tombstone = false;
         pmem::obj::persistent_ptr<KVNode> next = nullptr;
+        bool tombstone = false;
     };
 
     struct Page {
@@ -180,7 +184,9 @@ private:
         }
         collector.push_back(node.raw());
         visit_str(node->key, collector);
-        visit_str(node->value, collector);
+        if (!node->tombstone) {
+            visit_str(node->value, collector);
+        }
     }
 
 public:
@@ -289,6 +295,7 @@ public:
         kvnode->key = key;
         kvnode->value = value;
         kvnode->next = volatile_root_.load();
+        kvnode->tombstone = false;
         volatile_root_.store(kvnode);
 
         index_[key.view()] = kvnode;
@@ -369,19 +376,17 @@ public:
 
         KVNode* prev = nullptr;
         for (auto node = durable_root; node; node = node->next.get()) {
-            if (keys.find(node->key.view()) == keys.end() && !node->tombstone) {
-                visit_node(node, visited);
+            if ((keys.find(node->key.view()) != keys.end() || node->tombstone) && prev) {
+                pmem::obj::transaction::run(
+                    pool_,
+                    [&] {
+                        prev->next = node->next;
+                    });
             } else {
-                if (prev) {
-                    pmem::obj::transaction::run(
-                        pool_,
-                        [&] {
-                            prev->next = node->next;
-                        });
-                }
+                visit_node(node, visited);
+                prev = node;
             }
             keys.insert(node->key.view());
-            prev = node;
         }
 
         std::vector<pmem::obj::persistent_ptr<Page>> pages;
@@ -394,10 +399,10 @@ public:
         std::set<pmem::obj::persistent_ptr<Page>> page_set;
         size_t visited_pos = 0;
         for (auto page : pages) {
-            while (visited_pos < visited.size() && visited[visited_pos] < page) {
+            while (visited_pos < visited.size() && visited[visited_pos].raw().off < page.raw().off) {
                 ++visited_pos;
             }
-            if (visited_pos < visited.size() && visited[visited_pos].raw().off - page.raw().off < sizeof(Page)) {
+            if (visited_pos < visited.size() && visited[visited_pos].raw().off <= page.raw().off + sizeof(Page)) {
                 page_set.insert(page);
             }
         }
@@ -406,8 +411,20 @@ public:
             [&] {
                 for (auto page = stale_gc_root; page && page->next; page = page->next) {
                     if (page_set.find(page->next) == page_set.end()) {
-                        page->next->used = 0;
                         auto free = page->next;
+                        free->used = 0;
+#ifndef NDEBUG
+                        std::vector<pmem::obj::persistent_ptr<void>> visited;
+                        for (auto node = volatile_root_.load(); node; node = node->next.get()) {
+                            visit_node(node, visited);
+                        }
+                        for (auto [_, ptr] : index_) {
+                            visit_node(ptr, visited);
+                        }
+                        for (auto ptr : visited) {
+                            assert(ptr.raw().off < free.raw().off || ptr.raw().off > free.raw().off + sizeof(Page));
+                        }
+#endif
                         page->next = page->next->next;
                         free->next = root_->free_pages;
                         root_->free_pages = free;

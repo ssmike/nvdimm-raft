@@ -1,4 +1,4 @@
-#include "engine.h"
+#include "engine2.h"
 
 #include <unistd.h>
 
@@ -14,8 +14,15 @@ int main(int argc, char** argv) {
         keys.push_back(std::to_string(rand()));
         values.push_back(std::to_string(i));
         engine.insert(engine.copy_str(keys.back()), engine.copy_str(values.back()));
+
+        for (size_t j = 0; j + 1 < i; j++) {
+            engine.unsafe_erase(keys[j]);
+        }
         engine.commit();
         engine.gc();
+        for (size_t j = 0; j + 1 < i; j++) {
+            engine.insert(engine.copy_str(keys[j]), engine.copy_str(values[j]));
+        }
 
         for (size_t j = 0; j < keys.size(); ++j) {
             assert(engine.lookup(keys[j]));
