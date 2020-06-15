@@ -30,6 +30,9 @@ int main(int argc, char** argv) {
    pt = std::chrono::steady_clock::now();
    for (size_t i = 0; i < inserts; ++i) {
        engine.insert(engine.copy_str(keys[i]), engine.copy_str(values[i]));
+       if (i % 10 == 0) {
+           engine.commit();
+       }
    }
    std::cout << "engine inserts " << mcs() << std::endl;
 
@@ -44,6 +47,9 @@ int main(int argc, char** argv) {
    pt = std::chrono::steady_clock::now();
    for (size_t i = 0; i < keys.size(); ++i) {
        engine.unsafe_erase(keys[i]);
+       if (i % 10 == 0) {
+           engine.commit();
+       }
    }
    std::cout << "engine erases " << mcs() << std::endl;
 
@@ -64,6 +70,16 @@ int main(int argc, char** argv) {
             db.put(keys[i], values[i]);
         }
         std::cout << name << " inserts " << mcs() << std::endl;
+
+        pt = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < inserts; ++i) {
+            std::string val;
+            db.get(keys[i], &val);
+            if (val != values[i]) {
+                return 3;
+            }
+        }
+        std::cout << name << " lookups " << mcs() << std::endl;
 
         pt = std::chrono::steady_clock::now();
         for (size_t i = 0; i < inserts; ++i) {
