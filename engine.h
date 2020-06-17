@@ -90,6 +90,8 @@ private:
 
     static constexpr size_t max_children = 7;
     static constexpr size_t min_children = 4;
+    //static constexpr size_t max_children = 3;
+    //static constexpr size_t min_children = 2;
     struct KeyNode {
         std::array<pmem::obj::persistent_ptr<char>, max_children> children;
         std::array<PersistentStr, max_children> keys;
@@ -712,10 +714,10 @@ public:
         std::set<pmem::obj::persistent_ptr<Page>> page_set;
         size_t visited_pos = 0;
         for (auto page : pages) {
-            while (visited_pos < visited.size() && visited[visited_pos] < page) {
+            while (visited_pos < visited.size() && visited[visited_pos].raw().off < page.raw().off) {
                 ++visited_pos;
             }
-            if (visited_pos < visited.size() && visited[visited_pos].raw().off - page.raw().off < sizeof(Page)) {
+            if (visited_pos < visited.size() && visited[visited_pos].raw().off <= page.raw().off + sizeof(Page)) {
                 page_set.insert(page);
             }
         }
@@ -725,10 +727,19 @@ public:
                 for (auto page = stale_gc_root; page && page->next; page = page->next) {
                     if (page_set.find(page->next) == page_set.end()) {
                         auto free = page->next;
+                        free->used = 0;
+#ifndef NDEBUG
+                        std::vector<pmem::obj::persistent_ptr<void>> visited;
+                        for (auto node : gc_pinned_nodes_) {
+                            visit_node(volatile_root_, visited);
+                        }
+                        for (auto ptr : visited) {
+                            assert(ptr.raw().off < free.raw().off || ptr.raw().off > free.raw().off + sizeof(Page));
+                        }
+#endif
                         page->next = page->next->next;
                         free->next = root_->free_pages;
                         root_->free_pages = free;
-                        page->next->used = 0;
                     }
                 }
             });
