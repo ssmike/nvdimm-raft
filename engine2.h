@@ -262,7 +262,7 @@ public:
                 }
                 visited_keys.insert(node->key.view());
             }
-            volatile_root_.store(root_->durable_root_.get());
+            volatile_root_ = root_->durable_root_.get();
         } else {
             pool_ = pmem::obj::pool<Root>::create(fname, layout_, pool_size, mode);
             root_ = pool_.root().get();
@@ -294,9 +294,9 @@ public:
         auto kvnode = allocate<KVNode>();
         kvnode->key = key;
         kvnode->value = value;
-        kvnode->next = volatile_root_.load();
+        kvnode->next = volatile_root_;
         kvnode->tombstone = false;
-        volatile_root_.store(kvnode);
+        volatile_root_ = kvnode;
 
         index_[key.view()] = kvnode;
     }
@@ -321,8 +321,8 @@ public:
         auto kvnode = allocate<KVNode>();
         kvnode->key = copy_str(key);
         kvnode->tombstone = true;
-        kvnode->next = volatile_root_.load();
-        volatile_root_.store(kvnode);
+        kvnode->next = volatile_root_;
+        volatile_root_ = kvnode;
 
         index_.erase(key);
     }
@@ -351,7 +351,7 @@ public:
             pool_,
             [&] {
                 root_->stale_gc_root_ = root_->used_pages;
-                root_->durable_root_ = volatile_root_.load();
+                root_->durable_root_ = volatile_root_;
             });
     }
 
@@ -413,15 +413,6 @@ public:
                     if (page_set.find(page->next) == page_set.end()) {
                         auto free = page->next;
                         free->used = 0;
-#ifndef NDEBUG
-                        std::vector<pmem::obj::persistent_ptr<void>> visited;
-                        for (auto node = volatile_root_.load(); node; node = node->next.get()) {
-                            visit_node(node, visited);
-                        }
-                        for (auto ptr : visited) {
-                            assert(ptr.raw().off < free.raw().off || ptr.raw().off > free.raw().off + sizeof(Page));
-                        }
-#endif
                         page->next = page->next->next;
                         free->next = root_->free_pages;
                         root_->free_pages = free;
@@ -440,7 +431,7 @@ private:
     const std::string layout_ = "kv_engine";
     std::vector<DirtyPage> dirty_pages_;
 
-    std::atomic<KVNode*> volatile_root_ = nullptr;
+    KVNode* volatile_root_ = nullptr;
 
     std::mutex root_lock;
 };
