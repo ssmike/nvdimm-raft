@@ -34,7 +34,7 @@ public:
 
     bus::Future<ClientResponse> execute(ClientRequest req) {
         return bound_execute(req, leader_.load())
-            .chain([&] (ClientResponse& resp) {
+            .chain([=] (ClientResponse& resp) {
                     if (resp.should_retry()) {
                         leader_.store(resp.retry_to());
                         return bound_execute(req, resp.retry_to());
