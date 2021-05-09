@@ -9,6 +9,7 @@
 #include <libpmemobj++/container/string.hpp>
 #include <libpmemobj++/container/vector.hpp>
 
+#include <optional>
 #include <filesystem>
 #include <mutex>
 #include <set>
